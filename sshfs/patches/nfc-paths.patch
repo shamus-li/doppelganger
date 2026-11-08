@@ -1,0 +1,27 @@
+diff --git a/sshfs.c b/sshfs.c
+index 9dfa8c8..e4b622a 100644
+--- a/sshfs.c
++++ b/sshfs.c
+@@ -775,6 +775,22 @@ static inline void buf_add_path(struct buffer *buf, const char *path)
+ 		else
+ 			realpath = g_strdup(".");
+ 	}
++#ifdef __APPLE__
++	/* macFUSE's libfuse3 hands over names in decomposed form (NFD), but
++	   names on the server are usually precomposed (NFC) and compared
++	   byte for byte. ASCII names are the same in both. */
++	const char *c;
++	for (c = realpath; *c && !(*c & 0x80); c++)
++		;
++	if (*c) {
++		char *composed = g_utf8_normalize(realpath, -1,
++						  G_NORMALIZE_NFC);
++		if (composed) {
++			g_free(realpath);
++			realpath = composed;
++		}
++	}
++#endif
+ 	buf_add_string(buf, realpath);
+ 	g_free(realpath);
+ }

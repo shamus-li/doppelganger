@@ -1,0 +1,75 @@
+diff --git a/sshfs.c b/sshfs.c
+index c0b18af..9dfa8c8 100644
+--- a/sshfs.c
++++ b/sshfs.c
+@@ -221,6 +221,8 @@ struct conn {
+ 	int req_count;
+ 	int dir_count;
+ 	int file_count;
++	int connecting;
++	time_t connect_retry;
+ };
+ 
+ struct buffer {
+@@ -368,6 +370,7 @@ struct sshfs {
+ 	unsigned outstanding_len;
+ 	unsigned max_outstanding_len;
+ 	pthread_cond_t outstanding_cond;
++	pthread_cond_t connect_cond;
+ 	int password_stdin;
+ 	char *password;
+ 	int ext_posix_rename;
+@@ -1932,13 +1935,31 @@ static int start_processing_thread(struct conn *conn)
+ 	sigset_t oldset;
+ 	sigset_t newset;
+ 
++	/* Requests wait for a connect in progress instead of each starting
++	   one, and fail at once for a few seconds after one fails, so they
++	   don't each wait out the connect timeout in turn. */
++	while (conn->connecting)
++		pthread_cond_wait(&sshfs.connect_cond, &sshfs.lock);
++
+ 	if (conn->processing_thread_started)
+ 		return 0;
+ 
++	if (conn->rfd == -1 && time(NULL) < conn->connect_retry)
++		return -EIO;
++
+ 	if (conn->rfd == -1) {
++		conn->connecting = 1;
++		pthread_mutex_unlock(&sshfs.lock);
+ 		err = connect_remote(conn);
+-		if (err)
++		pthread_mutex_lock(&sshfs.lock);
++		conn->connecting = 0;
++		/* The waiters run once this thread releases the lock, after
++		   it has started the processing thread or given up. */
++		pthread_cond_broadcast(&sshfs.connect_cond);
++		if (err) {
++			conn->connect_retry = time(NULL) + 5;
+ 			return -EIO;
++		}
+ 	}
+ 
+ 	if (sshfs.detect_uid) {
+@@ -1980,8 +2001,11 @@ static void *sshfs_init(struct fuse_conn_info *conn,
+ 	// Lookup of . and .. is supported
+ 	conn->capable |= FUSE_CAP_EXPORT_SUPPORT;
+ 
+-	if (!sshfs.delay_connect)
++	if (!sshfs.delay_connect) {
++		pthread_mutex_lock(&sshfs.lock);
+ 		start_processing_thread(&sshfs.conns[0]);
++		pthread_mutex_unlock(&sshfs.lock);
++	}
+ 
+ 	// SFTP only supports 1-second time resolution
+ 	conn->time_gran = 1000000000;
+@@ -3679,6 +3703,7 @@ static int processing_init(void)
+ 	for (i = 0; i < sshfs.max_conns; i++)
+ 		pthread_mutex_init(&sshfs.conns[i].lock_write, NULL);
+ 	pthread_cond_init(&sshfs.outstanding_cond, NULL);
++	pthread_cond_init(&sshfs.connect_cond, NULL);
+ 	sshfs.reqtab = g_hash_table_new(NULL, NULL);
+ 	if (!sshfs.reqtab) {
+ 		fprintf(stderr, "failed to create hash table\n");

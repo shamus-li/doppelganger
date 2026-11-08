@@ -1,0 +1,139 @@
+diff --git a/sshfs.c b/sshfs.c
+index c13392c..25fd346 100644
+--- a/sshfs.c
++++ b/sshfs.c
+@@ -32,6 +32,7 @@
+ #include <sys/types.h>
+ #include <sys/time.h>
+ #include <sys/wait.h>
++#include <spawn.h>
+ #include <sys/socket.h>
+ #include <sys/utsname.h>
+ #include <sys/mman.h>
+@@ -228,6 +229,7 @@ struct conn {
+ 	int file_count;
+ 	int connecting;
+ 	time_t connect_retry;
++	pid_t ssh_pid;
+ };
+ 
+ struct buffer {
+@@ -1201,12 +1203,94 @@ static void replace_arg(char **argp, const char *newarg)
+ 	}
+ }
+ 
++extern char **environ;
++
++/* Starts ssh with posix_spawn instead of fork: sshfs runs several threads, and
++   a forked child that does more than exec can deadlock on a lock another
++   thread held. ssh gets the socket and stderr, and none of sshfs's other
++   files, such as the FUSE device. */
++static int spawn_ssh(struct conn *conn, int sock)
++{
++	posix_spawn_file_actions_t actions;
++	posix_spawnattr_t attr;
++	sigset_t none;
++	sigset_t defaults;
++	char **env;
++	pid_t pid;
++	int err;
++	int i;
++	int n;
++
++	for (n = 0; environ[n]; n++)
++		;
++	env = g_new(char *, n + 1);
++	for (i = n = 0; environ[i]; i++) {
++		/*
++		 * Avoid processes hanging trying to stat() OLDPWD if it is in
++		 * the mount point.
++		 */
++		if (strncmp(environ[i], "OLDPWD=", 7) != 0)
++			env[n++] = environ[i];
++	}
++	env[n] = NULL;
++
++	posix_spawn_file_actions_init(&actions);
++	posix_spawn_file_actions_adddup2(&actions, sock, 0);
++	posix_spawn_file_actions_adddup2(&actions, sock, 1);
++	if (sshfs.foreground)
++		posix_spawn_file_actions_addinherit_np(&actions, 2);
++	else
++		posix_spawn_file_actions_addopen(&actions, 2, "/dev/null",
++						 O_WRONLY, 0);
++	posix_spawn_file_actions_addchdir(&actions, "/");
++	posix_spawnattr_init(&attr);
++	/* FUSE's worker threads block all signals */
++	sigemptyset(&none);
++	posix_spawnattr_setsigmask(&attr, &none);
++	/* libfuse ignores SIGPIPE, and whatever started sshfs may have ignored
++	   others; close_conn ends ssh with SIGTERM and then waits for it */
++	sigemptyset(&defaults);
++	sigaddset(&defaults, SIGTERM);
++	sigaddset(&defaults, SIGINT);
++	sigaddset(&defaults, SIGHUP);
++	sigaddset(&defaults, SIGPIPE);
++	posix_spawnattr_setsigdefault(&attr, &defaults);
++	posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK |
++				 POSIX_SPAWN_SETSIGDEF |
++				 POSIX_SPAWN_CLOEXEC_DEFAULT);
++
++	if (sshfs.debug) {
++		fprintf(stderr, "executing");
++		for (i = 0; i < sshfs.ssh_args.argc; i++)
++			fprintf(stderr, " <%s>", sshfs.ssh_args.argv[i]);
++		fprintf(stderr, "\n");
++	}
++	err = posix_spawnp(&pid, sshfs.ssh_args.argv[0], &actions, &attr,
++			   sshfs.ssh_args.argv, env);
++	posix_spawnattr_destroy(&attr);
++	posix_spawn_file_actions_destroy(&actions);
++	g_free(env);
++	if (err) {
++		fprintf(stderr, "failed to execute '%s': %s\n",
++			sshfs.ssh_args.argv[0], strerror(err));
++		return -1;
++	}
++	conn->ssh_pid = pid;
++	return 0;
++}
++
+ static int start_ssh(struct conn *conn)
+ {
+ 	char *ptyname = NULL;
+ 	int sockpair[2];
+ 	int pid;
+ 
++	/* The ssh of the connection before, which close_conn ended */
++	if (conn->ssh_pid > 0) {
++		waitpid(conn->ssh_pid, NULL, 0);
++		conn->ssh_pid = 0;
++	}
++
+ 	if (sshfs.password_stdin) {
+ 
+ 		sshfs.ptyfd = pty_master(&ptyname);
+@@ -1225,6 +1309,13 @@ static int start_ssh(struct conn *conn)
+ 	conn->rfd = sockpair[0];
+ 	conn->wfd = sockpair[0];
+ 
++	/* A password on stdin needs a terminal, set up in a forked child */
++	if (!sshfs.password_stdin) {
++		int err = spawn_ssh(conn, sockpair[1]);
++		close(sockpair[1]);
++		return err;
++	}
++
+ 	pid = fork();
+ 	if (pid == -1) {
+ 		perror("failed to fork");
+@@ -1669,6 +1760,9 @@ static int process_one_request(struct conn *conn)
+ 
+ static void close_conn(struct conn *conn)
+ {
++	/* start_ssh reaps it */
++	if (conn->ssh_pid > 0)
++		kill(conn->ssh_pid, SIGTERM);
+ 	close(conn->rfd);
+ 	if (conn->rfd != conn->wfd)
+ 		close(conn->wfd);

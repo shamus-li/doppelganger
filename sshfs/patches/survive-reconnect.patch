@@ -1,0 +1,1957 @@
+diff --git a/sshfs.c b/sshfs.c
+index 51a17a0..c13392c 100644
+--- a/sshfs.c
++++ b/sshfs.c
+@@ -127,6 +127,11 @@
+ 
+ #define MY_EOF 1
+ 
++/* The connection closed before the reply came. The request is sent again
++   once sshfs has reconnected; this never reaches the kernel. */
++#define LOST (-ECONNRESET)
++#define MAX_TRIES 3
++
+ #define MAX_REPLY_LEN (1 << 17)
+ 
+ #define RENAME_TEMP_CHARS 8
+@@ -234,6 +239,7 @@ struct buffer {
+ struct dir_handle {
+ 	struct buffer buf;
+ 	struct conn *conn;
++	int connver;
+ };
+ 
+ struct list_head {
+@@ -258,6 +264,8 @@ struct request {
+ 	size_t len;
+ 	struct list_head list;
+ 	struct conn *conn;
++	/* The connection version it went out on */
++	int connver;
+ };
+ 
+ struct sshfs_io {
+@@ -301,6 +309,29 @@ struct sshfs_file {
+ 	int connver;
+ 	int modifver;
+ 	int written;
++	/* Guards handle and connver, which change when the file is opened
++	   again after a reconnect */
++	pthread_mutex_t lock;
++	/* How to open it again: without creating or truncating it */
++	uint32_t pflags;
++	/* Writes lost with a closed connection, in the order they were sent */
++	struct list_head lost_writes;
++	/* In sshfs.open_files, with the path to open it again by. 'refs'
++	   counts threads sending its lost writes for another file's request. */
++	struct list_head open_link;
++	char *path;
++	int refs;
++};
++
++/* A write's data, kept until the server confirms it */
++struct write_req {
++	struct list_head list;
++	struct sshfs_file *sf;
++	struct sshfs_io *sio;
++	uint64_t seq;
++	off_t offset;
++	size_t size;
++	char data[];
+ };
+ 
+ struct sshfs {
+@@ -369,6 +400,14 @@ struct sshfs {
+ 	char *progname;
+ 	long modifver;
+ 	unsigned outstanding_len;
++	uint64_t write_seq;
++	struct list_head open_files;
++	/* Some open file has writes lost with a closed connection */
++	int writes_lost;
++	int replaying;
++	/* Renames sent and not yet applied to the open files' paths */
++	int renames;
++	pthread_cond_t replay_cond;
+ 	unsigned max_outstanding_len;
+ 	pthread_cond_t outstanding_cond;
+ 	pthread_cond_t connect_cond;
+@@ -1423,8 +1462,10 @@ static size_t iov_length(const struct iovec *iov, unsigned long nr_segs)
+ 
+ #define SFTP_MAX_IOV 3
+ 
+-static int sftp_send_iov(struct conn *conn, uint8_t type, uint32_t id,
+-                         struct iovec iov[], size_t count)
++/* 'connver' is the connection the request was meant for, or -1 while
++   connecting */
++static int sftp_send_iov(struct conn *conn, int connver, uint8_t type,
++			 uint32_t id, struct iovec iov[], size_t count)
+ {
+ 	int res;
+ 	struct buffer buf;
+@@ -1441,7 +1482,12 @@ static int sftp_send_iov(struct conn *conn, uint8_t type, uint32_t id,
+ 	for (i = 0; i < count; i++)
+ 		iovout[nout++] = iov[i];
+ 	pthread_mutex_lock(&conn->lock_write);
+-	res = do_write(conn, iovout, nout);
++	/* Once its connection has closed, the file number may belong to the
++	   next connection, where the request would break the login */
++	if (connver != -1 && connver != conn->connver)
++		res = -1;
++	else
++		res = do_write(conn, iovout, nout);
+ 	pthread_mutex_unlock(&conn->lock_write);
+ 	buf_free(&buf);
+ 	return res;
+@@ -1540,7 +1586,7 @@ static int clean_req(void *key, struct request *req, gpointer user_data)
+ 	if (req->conn != conn)
+ 		return FALSE;
+ 
+-	req->error = -EIO;
++	req->error = LOST;
+ 	if (req->want_reply)
+ 		sem_post(&req->ready);
+ 	else
+@@ -1650,11 +1696,15 @@ static void *process_requests(void *data_)
+ 
+ 	pthread_mutex_lock(&sshfs.lock);
+ 	conn->processing_thread_started = 0;
++	pthread_mutex_lock(&conn->lock_write);
+ 	close_conn(conn);
+-	g_hash_table_foreach_remove(sshfs.reqtab, (GHRFunc) clean_req, conn);
+ 	conn->connver = ++sshfs.connvers;
++	pthread_mutex_unlock(&conn->lock_write);
++	g_hash_table_foreach_remove(sshfs.reqtab, (GHRFunc) clean_req, conn);
+ 	sshfs.outstanding_len = 0;
+ 	pthread_cond_broadcast(&sshfs.outstanding_cond);
++	/* For requests whose send failed (see sftp_request_send) */
++	pthread_cond_broadcast(&sshfs.connect_cond);
+ 	pthread_mutex_unlock(&sshfs.lock);
+ 
+ 	if (!sshfs.reconnect) {
+@@ -1768,7 +1818,7 @@ static int sftp_init(struct conn *conn)
+ 	uint32_t version = 0;
+ 	struct buffer buf;
+ 	buf_init(&buf, 0);
+-	if (sftp_send_iov(conn, SSH_FXP_INIT, PROTO_VERSION, NULL, 0) == -1)
++	if (sftp_send_iov(conn, -1, SSH_FXP_INIT, PROTO_VERSION, NULL, 0) == -1)
+ 		goto out;
+ 
+ 	if (sshfs.password_stdin && pty_expect_loop(conn) == -1)
+@@ -1818,7 +1868,7 @@ static void sftp_detect_uid(struct conn *conn)
+ 	buf_init(&buf, 5);
+ 	buf_add_string(&buf, ".");
+ 	buf_to_iov(&buf, &iov[0]);
+-	if (sftp_send_iov(conn, SSH_FXP_STAT, id, iov, 1) == -1)
++	if (sftp_send_iov(conn, -1, SSH_FXP_STAT, id, iov, 1) == -1)
+ 		goto out;
+ 	buf_clear(&buf);
+ 	if (sftp_read(conn, &type, &buf) == -1)
+@@ -1876,7 +1926,7 @@ static int sftp_check_root(struct conn *conn, const char *base_path)
+ 	buf_init(&buf, 0);
+ 	buf_add_string(&buf, remote_dir);
+ 	buf_to_iov(&buf, &iov[0]);
+-	if (sftp_send_iov(conn, SSH_FXP_LSTAT, id, iov, 1) == -1)
++	if (sftp_send_iov(conn, -1, SSH_FXP_LSTAT, id, iov, 1) == -1)
+ 		goto out;
+ 	buf_clear(&buf);
+ 	if (sftp_read(conn, &type, &buf) == -1)
+@@ -2010,12 +2060,9 @@ static void *sshfs_init(struct fuse_conn_info *conn,
+ 	if (conn->capable & FUSE_CAP_ASYNC_READ)
+ 		sshfs.sync_read = 1;
+ 
+-	// These workarounds require the "path" argument.
+-	cfg->nullpath_ok = !(sshfs.truncate_workaround || sshfs.fstat_workaround);
+-
+-	// When using multiple connections, release() needs to know the path
+-	if (sshfs.max_conns > 1)
+-		cfg->nullpath_ok = 0;
++	// Opening a file again after a reconnect needs its path, as do the
++	// truncate and fstat workarounds and release() with several connections
++	cfg->nullpath_ok = 0;
+ 
+ 	// Lookup of . and .. is supported
+ 	conn->capable |= FUSE_CAP_EXPORT_SUPPORT;
+@@ -2095,11 +2142,15 @@ out:
+ 	return err;
+ }
+ 
+-static int sftp_request_send(struct conn *conn, uint8_t type, struct iovec *iov,
+-			     size_t count, request_func begin_func, request_func end_func,
++/* 'connver' is the connection version a handle in the request belongs to,
++   or -1 for a request without one */
++static int sftp_request_send(struct conn *conn, int connver, uint8_t type,
++			     struct iovec *iov, size_t count,
++			     request_func begin_func, request_func end_func,
+ 			     int want_reply, void *data, struct request **reqp)
+ {
+ 	int err;
++	int sent_connver;
+ 	uint32_t id;
+ 	struct request *req = g_new0(struct request, 1);
+ 
+@@ -2115,15 +2166,32 @@ static int sftp_request_send(struct conn *conn, uint8_t type, struct iovec *iov,
+ 	req->id = id;
+ 	req->conn = conn;
+ 	req->conn->req_count++;
++	/* A handle from a closed connection could name another file on the
++	   next one: the server numbers handles from 0 on each connection */
++	if (connver != -1 && connver != conn->connver) {
++		pthread_mutex_unlock(&sshfs.lock);
++		err = LOST;
++		goto out;
++	}
+ 	err = start_processing_thread(conn);
+ 	if (err) {
+ 		pthread_mutex_unlock(&sshfs.lock);
+ 		goto out;
+ 	}
++	sent_connver = conn->connver;
+ 	req->len = iov_length(iov, count) + 9;
+ 	sshfs.outstanding_len += req->len;
+-	while (sshfs.outstanding_len > sshfs.max_outstanding_len)
++	while (sshfs.outstanding_len > sshfs.max_outstanding_len &&
++	       conn->connver == sent_connver)
+ 		pthread_cond_wait(&sshfs.outstanding_cond, &sshfs.lock);
++	/* The connection closed while this waited, which also reset
++	   outstanding_len */
++	if (conn->connver != sent_connver) {
++		pthread_mutex_unlock(&sshfs.lock);
++		err = LOST;
++		goto out;
++	}
++	req->connver = sent_connver;
+ 
+ 	g_hash_table_insert(sshfs.reqtab, GUINT_TO_POINTER(id), req);
+ 	if (sshfs.debug) {
+@@ -2134,12 +2202,20 @@ static int sftp_request_send(struct conn *conn, uint8_t type, struct iovec *iov,
+ 	DEBUG("[%05i] %s\n", id, type_name(type));
+ 	pthread_mutex_unlock(&sshfs.lock);
+ 
+-	err = -EIO;
+-	if (sftp_send_iov(conn, type, id, iov, count) == -1) {
++	err = LOST;
++	if (sftp_send_iov(conn, sent_connver, type, id, iov, count) == -1) {
+ 		gboolean rmed;
+ 
+ 		pthread_mutex_lock(&sshfs.lock);
+ 		rmed = g_hash_table_remove(sshfs.reqtab, GUINT_TO_POINTER(id));
++		/* Close the connection, since part of a request may have gone
++		   out, and wait until the processing thread has cleaned up, so
++		   a request sent again goes out on the next one */
++		if (conn->connver == sent_connver)
++			shutdown(conn->rfd, SHUT_RDWR);
++		while (conn->processing_thread_started &&
++		       conn->connver == sent_connver)
++			pthread_cond_wait(&sshfs.connect_cond, &sshfs.lock);
+ 		pthread_mutex_unlock(&sshfs.lock);
+ 
+ 		if (!rmed && !want_reply) {
+@@ -2162,13 +2238,14 @@ out:
+ 	return err;
+ }
+ 
+-static int sftp_request_iov(struct conn *conn, uint8_t type, struct iovec *iov,
+-			    size_t count, uint8_t expect_type, struct buffer *outbuf)
++static int sftp_request_iov(struct conn *conn, int connver, uint8_t type,
++			    struct iovec *iov, size_t count,
++			    uint8_t expect_type, struct buffer *outbuf)
+ {
+ 	int err;
+ 	struct request *req;
+ 
+-	err = sftp_request_send(conn, type, iov, count, NULL, NULL,
++	err = sftp_request_send(conn, connver, type, iov, count, NULL, NULL,
+ 				expect_type, NULL, &req);
+ 	if (expect_type == 0)
+ 		return err;
+@@ -2176,13 +2253,112 @@ static int sftp_request_iov(struct conn *conn, uint8_t type, struct iovec *iov,
+ 	return sftp_request_wait(req, type, expect_type, outbuf);
+ }
+ 
++static void replay_lost_writes(void);
++
++/* Sends a request that names its file by path, and again if the connection
++   closes before the reply. '*repeated' tells whether it was sent again, so a
++   request that changes something can tell an error caused by the lost one
++   having taken effect. */
+ static int sftp_request(struct conn *conn, uint8_t type, const struct buffer *buf,
+-			uint8_t expect_type, struct buffer *outbuf)
++			uint8_t expect_type, struct buffer *outbuf, int *repeated)
+ {
+ 	struct iovec iov;
++	int err = LOST;
++	int tries;
+ 
+ 	buf_to_iov(buf, &iov);
+-	return sftp_request_iov(conn, type, &iov, 1, expect_type, outbuf);
++	/* Before each try: the writes may have been lost with the same
++	   connection, and a stat sent before them would report the size the
++	   file had without them, which macOS takes for the file's size and
++	   fills with zeros up to the next write */
++	for (tries = 0; err == LOST && tries < MAX_TRIES; tries++) {
++		replay_lost_writes();
++		err = sftp_request_iov(conn, -1, type, &iov, 1, expect_type,
++				       outbuf);
++	}
++	if (repeated)
++		*repeated = tries > 1;
++	return err == LOST ? -EIO : err;
++}
++
++/* Sends a request that opens a file or directory, and returns the handle with
++   the connection version it belongs to. A request that couldn't be sent, as
++   when the server can't be reached, counts as lost. */
++static int sftp_open_handle(struct conn *conn, uint8_t type,
++			    const struct buffer *buf, struct buffer *handle,
++			    int *connver)
++{
++	struct iovec iov;
++	struct request *req;
++	int err;
++	int sent;
++
++	buf_to_iov(buf, &iov);
++	sent = sftp_request_send(conn, -1, type, &iov, 1, NULL, NULL, 1, NULL,
++				 &req) == 0;
++	if (sent)
++		*connver = req->connver;
++	err = sftp_request_wait(req, type, SSH_FXP_HANDLE, handle);
++	if (!err)
++		buf_finish(handle);
++	return sent ? err : LOST;
++}
++
++/* Closes a handle without waiting; nothing is sent if its connection has
++   closed, which closed the handle too */
++static void sftp_close(struct conn *conn, int connver, struct buffer *handle)
++{
++	struct iovec iov;
++
++	buf_to_iov(handle, &iov);
++	sftp_request_iov(conn, connver, SSH_FXP_CLOSE, &iov, 1, 0, NULL);
++}
++
++/* Adds an open file's handle to 'buf', and returns the connection version it
++   belongs to */
++static int sf_add_handle(struct sshfs_file *sf, struct buffer *buf)
++{
++	int connver;
++
++	pthread_mutex_lock(&sf->lock);
++	buf_add_buf(buf, &sf->handle);
++	connver = sf->connver;
++	pthread_mutex_unlock(&sf->lock);
++	return connver;
++}
++
++static int sf_refresh(struct sshfs_file *sf);
++
++/* Sends a request about an open file and waits for the reply, opening the
++   file again first if its connection has closed. 'ext' names an extended
++   request; 'args' follow the handle. */
++static int sf_request(struct sshfs_file *sf, uint8_t type, const char *ext,
++		      const struct buffer *args, uint8_t expect_type,
++		      struct buffer *outbuf)
++{
++	int err = LOST;
++	int tries;
++
++	for (tries = 0; err == LOST && tries < MAX_TRIES; tries++) {
++		struct buffer buf;
++		struct iovec iov;
++		int connver;
++
++		err = sf_refresh(sf);
++		if (err)
++			break;
++		buf_init(&buf, 0);
++		if (ext)
++			buf_add_string(&buf, ext);
++		connver = sf_add_handle(sf, &buf);
++		if (args)
++			buf_add_buf(&buf, args);
++		buf_to_iov(&buf, &iov);
++		err = sftp_request_iov(sf->conn, connver, type, &iov, 1,
++				       expect_type, outbuf);
++		buf_free(&buf);
++	}
++	return err == LOST ? -EIO : err;
+ }
+ 
+ /* Sends a stat of the file behind the requests already sent for it, so its
+@@ -2192,14 +2368,15 @@ static void sftp_stat_send(struct conn *conn, const char *path,
+ {
+ 	struct buffer buf;
+ 	struct iovec iov;
++	int connver = -1;
+ 
+ 	buf_init(&buf, 0);
+ 	if (sf != NULL)
+-		buf_add_buf(&buf, &sf->handle);
++		connver = sf_add_handle(sf, &buf);
+ 	else
+ 		buf_add_path(&buf, path);
+ 	buf_to_iov(&buf, &iov);
+-	sftp_request_send(conn, sf != NULL ? SSH_FXP_FSTAT :
++	sftp_request_send(conn, connver, sf != NULL ? SSH_FXP_FSTAT :
+ 			  sshfs.follow_symlinks ? SSH_FXP_STAT : SSH_FXP_LSTAT,
+ 			  &iov, 1, NULL, NULL, 1, NULL, reqp);
+ 	buf_free(&buf);
+@@ -2224,29 +2401,63 @@ static void sftp_stat_cache(struct request *req, const char *path,
+ 	buf_free(&outbuf);
+ }
+ 
+-/* Sends a request that changes attributes together with a stat */
+-static int sftp_setstat(struct conn *conn, uint8_t type,
+-			const struct buffer *buf, const char *path,
++static uint8_t buf_add_setstat_path(struct buffer *buf, const char *path);
++
++/* Sends a request that changes attributes together with a stat, and again if
++   the connection closes first. 'attrs' follow the handle of 'sf', or else the
++   path. By path, 'follow' changes what a symlink points to, for a size, which
++   lsetstat refuses; otherwise it changes the link itself. */
++static int sftp_setstat(struct conn *conn, int follow,
++			const struct buffer *attrs, const char *path,
+ 			struct sshfs_file *sf)
+ {
+-	int err;
+-	struct request *req;
+-	struct request *stat_req;
+-	struct iovec iov;
+-	uint64_t wrctr;
++	int err = LOST;
++	int tries;
+ 
+-	if (!sshfs.dir_cache)
+-		return sftp_request(conn, type, buf, SSH_FXP_STATUS, NULL);
+-
+-	wrctr = cache_get_write_ctr();
+-	buf_to_iov(buf, &iov);
+-	sftp_request_send(conn, type, &iov, 1, NULL, NULL, 1, NULL, &req);
+-	sftp_stat_send(conn, path, sf, &stat_req);
+-	err = sftp_request_wait(req, type, SSH_FXP_STATUS, NULL);
+-	sftp_stat_cache(stat_req, path, wrctr, !err);
+-	if (sf != NULL)
+-		sf->written = 0;
+-	return err;
++	for (tries = 0; err == LOST && tries < MAX_TRIES; tries++) {
++		struct request *req;
++		struct request *stat_req;
++		struct buffer buf;
++		struct iovec iov;
++		uint64_t wrctr;
++		uint8_t type;
++		int connver = -1;
++
++		if (sf != NULL) {
++			err = sf_refresh(sf);
++			if (err)
++				break;
++		} else {
++			replay_lost_writes();
++		}
++		buf_init(&buf, 0);
++		if (sf != NULL) {
++			connver = sf_add_handle(sf, &buf);
++			type = SSH_FXP_FSETSTAT;
++		} else if (follow) {
++			buf_add_path(&buf, path);
++			type = SSH_FXP_SETSTAT;
++		} else {
++			type = buf_add_setstat_path(&buf, path);
++		}
++		buf_add_buf(&buf, attrs);
++		buf_to_iov(&buf, &iov);
++		if (!sshfs.dir_cache) {
++			err = sftp_request_iov(conn, connver, type, &iov, 1,
++					       SSH_FXP_STATUS, NULL);
++		} else {
++			wrctr = cache_get_write_ctr();
++			sftp_request_send(conn, connver, type, &iov, 1, NULL,
++					  NULL, 1, NULL, &req);
++			sftp_stat_send(conn, path, sf, &stat_req);
++			err = sftp_request_wait(req, type, SSH_FXP_STATUS, NULL);
++			sftp_stat_cache(stat_req, path, wrctr, !err);
++			if (sf != NULL)
++				sf->written = 0;
++		}
++		buf_free(&buf);
++	}
++	return err == LOST ? -EIO : err;
+ }
+ 
+ static int sshfs_access(const char *path, int mask)
+@@ -2375,7 +2586,7 @@ static int sshfs_readlink(const char *path, char *linkbuf, size_t size)
+ 	buf_init(&buf, 0);
+ 	buf_add_path(&buf, path);
+ 	// Commutes with pending write(), so we can use any connection
+-	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_READLINK, &buf, SSH_FXP_NAME, &name);
++	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_READLINK, &buf, SSH_FXP_NAME, &name, NULL);
+ 	if (!err) {
+ 		uint32_t count;
+ 		char *link;
+@@ -2402,14 +2613,29 @@ static int sshfs_readlink(const char *path, char *linkbuf, size_t size)
+ 	return err;
+ }
+ 
+-static int sftp_readdir_send(struct conn *conn, struct request **req,
+-			     struct buffer *handle)
++static int sftp_readdir_send(struct dir_handle *handle, struct request **req)
+ {
+ 	struct iovec iov;
+ 
+-	buf_to_iov(handle, &iov);
+-	return sftp_request_send(conn, SSH_FXP_READDIR, &iov, 1, NULL, NULL,
+-				 SSH_FXP_NAME, NULL, req);
++	buf_to_iov(&handle->buf, &iov);
++	return sftp_request_send(handle->conn, handle->connver, SSH_FXP_READDIR,
++				 &iov, 1, NULL, NULL, SSH_FXP_NAME, NULL, req);
++}
++
++/* Keeps a reply to READDIR; the entries go to the kernel once the listing
++   is complete, so one lost with the connection can start over */
++static GList *readdir_keep(GList *names, struct buffer *name)
++{
++	struct buffer *kept = g_new(struct buffer, 1);
++
++	*kept = *name;
++	return g_list_append(names, kept);
++}
++
++static void readdir_free(gpointer name)
++{
++	buf_free(name);
++	g_free(name);
+ }
+ 
+ static int sshfs_req_pending(struct request *req)
+@@ -2420,8 +2646,7 @@ static int sshfs_req_pending(struct request *req)
+ 		return 0;
+ }
+ 
+-static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
+-			      void *buf, off_t offset, fuse_fill_dir_t filler)
++static int sftp_readdir_async(struct dir_handle *handle, GList **names)
+ {
+ 	int err = 0;
+ 	int outstanding = 0;
+@@ -2430,18 +2655,19 @@ static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
+ 
+ 	int done = 0;
+ 
+-	assert(offset == 0);
+ 	while (!done || outstanding) {
+ 		struct request *req;
+ 		struct buffer name;
+ 		int tmperr;
+ 
+ 		while (!done && outstanding < max) {
+-			tmperr = sftp_readdir_send(conn, &req, handle);
++			tmperr = sftp_readdir_send(handle, &req);
+ 
+ 			if (tmperr && !done) {
+ 				err = tmperr;
+ 				done = 1;
++				sftp_request_wait(req, SSH_FXP_READDIR,
++						  SSH_FXP_NAME, NULL);
+ 				break;
+ 			}
+ 
+@@ -2481,15 +2707,11 @@ static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
+ 				done = 1;
+ 			}
+ 			if (!done) {
+-				err = buf_get_entries(&name, buf, filler);
+-				buf_free(&name);
++				*names = readdir_keep(*names, &name);
+ 
+ 				/* increase number of outstanding requests */
+ 				if (max < READDIR_MAX)
+ 					max++;
+-
+-				if (err)
+-					done = 1;
+ 			}
+ 		}
+ 	}
+@@ -2498,18 +2720,19 @@ static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
+ 	return err;
+ }
+ 
+-static int sftp_readdir_sync(struct conn *conn, struct buffer *handle,
+-			     void *buf, off_t offset, fuse_fill_dir_t filler)
++static int sftp_readdir_sync(struct dir_handle *handle, GList **names)
+ {
+ 	int err;
+-	assert(offset == 0);
++	struct iovec iov;
++
++	buf_to_iov(&handle->buf, &iov);
+ 	do {
+ 		struct buffer name;
+-		err = sftp_request(conn, SSH_FXP_READDIR, handle, SSH_FXP_NAME, &name);
+-		if (!err) {
+-			err = buf_get_entries(&name, buf, filler);
+-			buf_free(&name);
+-		}
++		err = sftp_request_iov(handle->conn, handle->connver,
++				       SSH_FXP_READDIR, &iov, 1, SSH_FXP_NAME,
++				       &name);
++		if (!err)
++			*names = readdir_keep(*names, &name);
+ 	} while (!err);
+ 	if (err == MY_EOF)
+ 		err = 0;
+@@ -2517,32 +2740,42 @@ static int sftp_readdir_sync(struct conn *conn, struct buffer *handle,
+ 	return err;
+ }
+ 
++/* Opens a directory, again if the connection closes first */
++static int sftp_opendir(const char *path, struct dir_handle *handle)
++{
++	int err = LOST;
++	int tries;
++	struct buffer buf;
++
++	buf_init(&buf, 0);
++	buf_add_path(&buf, path);
++	for (tries = 0; err == LOST && tries < MAX_TRIES; tries++)
++		err = sftp_open_handle(handle->conn, SSH_FXP_OPENDIR, &buf,
++				       &handle->buf, &handle->connver);
++	buf_free(&buf);
++	return err == LOST ? -EIO : err;
++}
++
+ static int sshfs_opendir(const char *path, struct fuse_file_info *fi)
+ {
+ 	int err;
+-	struct conn *conn;
+-	struct buffer buf;
+ 	struct dir_handle *handle;
+ 
+ 	handle = g_new0(struct dir_handle, 1);
+ 	if(handle == NULL)
+ 		return -ENOMEM;
+ 
++	replay_lost_writes();
+ 	// Commutes with pending write(), so we can use any connection
+-	conn = get_conn(NULL, NULL);
+-	buf_init(&buf, 0);
+-	buf_add_path(&buf, path);
+-	err = sftp_request(conn, SSH_FXP_OPENDIR, &buf, SSH_FXP_HANDLE, &handle->buf);
++	handle->conn = get_conn(NULL, NULL);
++	err = sftp_opendir(path, handle);
+ 	if (!err) {
+-		buf_finish(&handle->buf);
+ 		pthread_mutex_lock(&sshfs.lock);
+-		handle->conn = conn;
+ 		handle->conn->dir_count++;
+ 		pthread_mutex_unlock(&sshfs.lock);
+ 		fi->fh = (unsigned long) handle;
+ 	} else
+ 		g_free(handle);
+-	buf_free(&buf);
+ 	return err;
+ }
+ 
+@@ -2550,50 +2783,99 @@ static int sshfs_readdir(const char *path, void *dbuf, fuse_fill_dir_t filler,
+ 			 off_t offset, struct fuse_file_info *fi,
+ 			 enum fuse_readdir_flags flags)
+ {
+-	(void) path; (void) flags;
+-	int err;
++	(void) flags;
++	int err = LOST;
++	int tries;
+ 	struct dir_handle *handle;
+ 
++	assert(offset == 0);
+ 	handle = (struct dir_handle*) fi->fh;
+ 
+-	if (sshfs.sync_readdir)
+-		err = sftp_readdir_sync(handle->conn, &handle->buf, dbuf,
+-					offset, filler);
+-	else
+-		err = sftp_readdir_async(handle->conn, &handle->buf, dbuf,
+-					 offset, filler);
++	for (tries = 0; err == LOST && tries < MAX_TRIES; tries++) {
++		GList *names = NULL;
++		GList *name;
++		int stale;
+ 
+-	return err;
++		/* Listings carry sizes too: see sftp_request */
++		replay_lost_writes();
++
++		pthread_mutex_lock(&sshfs.lock);
++		stale = handle->connver != handle->conn->connver;
++		pthread_mutex_unlock(&sshfs.lock);
++		if (stale) {
++			/* Its connection closed: open it again */
++			buf_free(&handle->buf);
++			buf_init(&handle->buf, 0);
++			err = sftp_opendir(path, handle);
++			if (err)
++				return err;
++		}
++
++		if (sshfs.sync_readdir)
++			err = sftp_readdir_sync(handle, &names);
++		else
++			err = sftp_readdir_async(handle, &names);
++
++		for (name = names; !err && name; name = name->next)
++			err = buf_get_entries(name->data, dbuf, filler);
++		g_list_free_full(names, readdir_free);
++	}
++
++	return err == LOST ? -EIO : err;
+ }
+ 
+ static int sshfs_releasedir(const char *path, struct fuse_file_info *fi)
+ {
+ 	(void) path;
+-	int err;
+ 	struct dir_handle *handle;
+ 
+ 	handle = (struct dir_handle*) fi->fh;
+-	err = sftp_request(handle->conn, SSH_FXP_CLOSE, &handle->buf, 0, NULL);
++	sftp_close(handle->conn, handle->connver, &handle->buf);
+ 	pthread_mutex_lock(&sshfs.lock);
+ 	handle->conn->dir_count--;
+ 	pthread_mutex_unlock(&sshfs.lock);
+ 	buf_free(&handle->buf);
+ 	g_free(handle);
+-	return err;
++	return 0;
+ }
+ 
+ 
++static int sshfs_getattr(const char *path, struct stat *stbuf,
++			 struct fuse_file_info *fi);
++
++/* Whether 'path' is now a file of 'type' (or of any type, for 0), after a
++   repeated request to create it failed: the lost one may have created it */
++static int sshfs_created(const char *path, mode_t type)
++{
++	struct stat stbuf;
++
++	return sshfs_getattr(path, &stbuf, NULL) == 0 &&
++		(!type || (stbuf.st_mode & S_IFMT) == type);
++}
++
++/* Whether 'from' was moved to 'to', after a repeated rename got ENOENT */
++static int sshfs_renamed(const char *from, const char *to)
++{
++	struct stat stbuf;
++
++	return sshfs_getattr(from, &stbuf, NULL) == -ENOENT &&
++		sshfs_getattr(to, &stbuf, NULL) == 0;
++}
++
+ static int sshfs_mkdir(const char *path, mode_t mode)
+ {
+ 	int err;
++	int repeated;
+ 	struct buffer buf;
+ 	buf_init(&buf, 0);
+ 	buf_add_path(&buf, path);
+ 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_PERMISSIONS);
+ 	buf_add_uint32(&buf, mode);
+ 	// Commutes with pending write(), so we can use any connection
+-	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_MKDIR, &buf, SSH_FXP_STATUS, NULL);
++	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_MKDIR, &buf, SSH_FXP_STATUS, NULL, &repeated);
+ 	buf_free(&buf);
++	if (repeated && err && sshfs_created(path, S_IFDIR))
++		return 0;
+ 
+ 	if (err == -EPERM) {
+ 		if (sshfs.op->access(path, R_OK) == 0) {
+@@ -2610,6 +2892,8 @@ static int sshfs_mknod(const char *path, mode_t mode, dev_t rdev)
+ 	struct conn *conn;
+ 	struct buffer buf;
+ 	struct buffer handle;
++	int connver;
++	int tries;
+ 	(void) rdev;
+ 
+ 	if ((mode & S_IFMT) != S_IFREG)
+@@ -2623,15 +2907,20 @@ static int sshfs_mknod(const char *path, mode_t mode, dev_t rdev)
+ 	buf_add_uint32(&buf, SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_EXCL);
+ 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_PERMISSIONS);
+ 	buf_add_uint32(&buf, mode);
+-	err = sftp_request(conn, SSH_FXP_OPEN, &buf, SSH_FXP_HANDLE, &handle);
+-	if (!err) {
+-		int err2;
+-		buf_finish(&handle);
+-		err2 = sftp_request(conn, SSH_FXP_CLOSE, &handle, SSH_FXP_STATUS, NULL);
+-		if (!err)
+-			err = err2;
+-		buf_free(&handle);
+-	}
++	buf_init(&handle, 0);
++	err = LOST;
++	for (tries = 0; err == LOST && tries < MAX_TRIES; tries++) {
++		replay_lost_writes();
++		err = sftp_open_handle(conn, SSH_FXP_OPEN, &buf, &handle,
++				       &connver);
++	}
++	if (err == LOST)
++		err = -EIO;
++	if (!err)
++		sftp_close(conn, connver, &handle);
++	else if (tries > 1 && sshfs_created(path, S_IFREG))
++		err = 0;
++	buf_free(&handle);
+ 	buf_free(&buf);
+ 	return err;
+ }
+@@ -2639,6 +2928,7 @@ static int sshfs_mknod(const char *path, mode_t mode, dev_t rdev)
+ static int sshfs_symlink(const char *from, const char *to)
+ {
+ 	int err;
++	int repeated;
+ 	struct buffer buf;
+ 
+ 	if (sshfs.server_version < 3)
+@@ -2650,59 +2940,92 @@ static int sshfs_symlink(const char *from, const char *to)
+ 	buf_add_string(&buf, from);
+ 	buf_add_path(&buf, to);
+ 	// Commutes with pending write(), so we can use any connection
+-	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_SYMLINK, &buf, SSH_FXP_STATUS, NULL);
++	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_SYMLINK, &buf, SSH_FXP_STATUS, NULL, &repeated);
+ 	buf_free(&buf);
++	if (repeated && err && sshfs_created(to, S_IFLNK))
++		err = 0;
+ 	return err;
+ }
+ 
+ static int sshfs_unlink(const char *path)
+ {
+ 	int err;
++	int repeated;
+ 	struct buffer buf;
+ 	buf_init(&buf, 0);
+ 	buf_add_path(&buf, path);
+ 	// Commutes with pending write(), so we can use any connection
+-	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_REMOVE, &buf, SSH_FXP_STATUS, NULL);
++	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_REMOVE, &buf, SSH_FXP_STATUS, NULL, &repeated);
+ 	buf_free(&buf);
++	/* The lost request did it */
++	if (repeated && err == -ENOENT)
++		err = 0;
++	if (!err) {
++		/* A file open under this name can't be opened again by it:
++		   that would open whatever is created there next */
++		struct list_head *pos;
++
++		pthread_mutex_lock(&sshfs.lock);
++		for (pos = sshfs.open_files.next; pos != &sshfs.open_files;
++		     pos = pos->next) {
++			struct sshfs_file *sf = list_entry(pos,
++				struct sshfs_file, open_link);
++			if (sf->path && strcmp(sf->path, path) == 0) {
++				g_free(sf->path);
++				sf->path = NULL;
++			}
++		}
++		pthread_mutex_unlock(&sshfs.lock);
++	}
+ 	return err;
+ }
+ 
+ static int sshfs_rmdir(const char *path)
+ {
+ 	int err;
++	int repeated;
+ 	struct buffer buf;
+ 	buf_init(&buf, 0);
+ 	buf_add_path(&buf, path);
+ 	// Commutes with pending write(), so we can use any connection
+-	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_RMDIR, &buf, SSH_FXP_STATUS, NULL);
++	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_RMDIR, &buf, SSH_FXP_STATUS, NULL, &repeated);
+ 	buf_free(&buf);
++	/* The lost request did it */
++	if (repeated && err == -ENOENT)
++		err = 0;
+ 	return err;
+ }
+ 
+ static int sshfs_do_rename(const char *from, const char *to)
+ {
+ 	int err;
++	int repeated;
+ 	struct buffer buf;
+ 	buf_init(&buf, 0);
+ 	buf_add_path(&buf, from);
+ 	buf_add_path(&buf, to);
+ 	// Commutes with pending write(), so we can use any connection
+-	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_RENAME, &buf, SSH_FXP_STATUS, NULL);
++	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_RENAME, &buf, SSH_FXP_STATUS, NULL, &repeated);
+ 	buf_free(&buf);
++	if (repeated && err == -ENOENT && sshfs_renamed(from, to))
++		err = 0;
+ 	return err;
+ }
+ 
+ static int sshfs_ext_posix_rename(const char *from, const char *to)
+ {
+ 	int err;
++	int repeated;
+ 	struct buffer buf;
+ 	buf_init(&buf, 0);
+ 	buf_add_string(&buf, SFTP_EXT_POSIX_RENAME);
+ 	buf_add_path(&buf, from);
+ 	buf_add_path(&buf, to);
+ 	// Commutes with pending write(), so we can use any connection
+-	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_EXTENDED, &buf, SSH_FXP_STATUS, NULL);
++	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_EXTENDED, &buf, SSH_FXP_STATUS, NULL, &repeated);
+ 	buf_free(&buf);
++	if (repeated && err == -ENOENT && sshfs_renamed(from, to))
++		err = 0;
+ 	return err;
+ }
+ 
+@@ -2722,6 +3045,9 @@ static int sshfs_rename(const char *from, const char *to, unsigned int flags)
+ 	if(flags != 0)
+ 		return -EINVAL;
+ 
++	pthread_mutex_lock(&sshfs.lock);
++	sshfs.renames++;
++	pthread_mutex_unlock(&sshfs.lock);
+ 	if (sshfs.ext_posix_rename)
+ 		err = sshfs_ext_posix_rename(from, to);
+ 	else
+@@ -2746,6 +3072,28 @@ static int sshfs_rename(const char *from, const char *to, unsigned int flags)
+ 	if (err == -EPERM && sshfs.renamexdev_workaround)
+ 		err = -EXDEV;
+ 
++	pthread_mutex_lock(&sshfs.lock);
++	sshfs.renames--;
++	if (!err) {
++		struct list_head *pos;
++		size_t fromlen = strlen(from);
++
++		for (pos = sshfs.open_files.next; pos != &sshfs.open_files;
++		     pos = pos->next) {
++			struct sshfs_file *sf = list_entry(pos,
++				struct sshfs_file, open_link);
++			if (sf->path && strncmp(sf->path, from, fromlen) == 0 &&
++			    (sf->path[fromlen] == '\0' ||
++			     sf->path[fromlen] == '/')) {
++				char *moved = g_strconcat(to, sf->path + fromlen,
++							  NULL);
++				g_free(sf->path);
++				sf->path = moved;
++			}
++		}
++	}
++	pthread_mutex_unlock(&sshfs.lock);
++
+ 	if (!err && sshfs.max_conns > 1) {
+ 		pthread_mutex_lock(&sshfs.lock);
+ 		ce = g_hash_table_lookup(sshfs.conntab, from);
+@@ -2765,6 +3113,7 @@ static int sshfs_link(const char *from, const char *to)
+ 
+ 	if (sshfs.ext_hardlink && !sshfs.disable_hardlink) {
+ 		struct buffer buf;
++		int repeated;
+ 
+ 		buf_init(&buf, 0);
+ 		buf_add_string(&buf, SFTP_EXT_HARDLINK);
+@@ -2772,22 +3121,270 @@ static int sshfs_link(const char *from, const char *to)
+ 		buf_add_path(&buf, to);
+ 		// Commutes with pending write(), so we can use any connection
+ 		err = sftp_request(get_conn(NULL, NULL), SSH_FXP_EXTENDED, &buf, SSH_FXP_STATUS,
+-				   NULL);
++				   NULL, &repeated);
+ 		buf_free(&buf);
++		if (repeated && err && sshfs_created(to, 0))
++			err = 0;
+ 	}
+ 
+ 	return err;
+ }
+ 
+-static inline int sshfs_file_is_conn(struct sshfs_file *sf)
++static int sshfs_send_write(struct sshfs_file *sf, struct write_req *wr,
++			    request_func begin_func, request_func end_func);
++static void sshfs_sync_write_begin(struct request *req);
++static void sshfs_sync_write_end(struct request *req);
++
++static int sf_open_path(struct sshfs_file *sf, const char *path,
++			struct buffer *handle, int *connver)
++{
++	struct buffer buf;
++	int err;
++
++	buf_init(&buf, 0);
++	buf_add_path(&buf, path);
++	buf_add_uint32(&buf, sf->pflags);
++	buf_add_uint32(&buf, 0);
++	err = sftp_open_handle(sf->conn, SSH_FXP_OPEN, &buf, handle, connver);
++	buf_free(&buf);
++	return err;
++}
++
++static int sf_set_mode(struct sshfs_file *sf, const char *path, mode_t mode)
++{
++	struct buffer buf;
++	struct iovec iov;
++	int err;
++
++	buf_init(&buf, 0);
++	buf_add_path(&buf, path);
++	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_PERMISSIONS);
++	buf_add_uint32(&buf, mode & 07777);
++	buf_to_iov(&buf, &iov);
++	err = sftp_request_iov(sf->conn, -1, SSH_FXP_SETSTAT, &iov, 1,
++			       SSH_FXP_STATUS, NULL);
++	buf_free(&buf);
++	return err;
++}
++
++/* A descriptor open for writing stays writable whatever the file's mode
++   becomes, and git, for one, creates its objects read-only and writes them
++   through the descriptor it created them with. Opening such a file again for
++   writing needs the owner's write permission for a moment. */
++static int sf_open_unwritable(struct sshfs_file *sf, const char *path,
++			      struct buffer *handle, int *connver)
++{
++	struct buffer buf;
++	struct buffer outbuf;
++	struct iovec iov;
++	struct stat stbuf;
++	int err;
++
++	buf_init(&buf, 0);
++	buf_add_path(&buf, path);
++	buf_to_iov(&buf, &iov);
++	err = sftp_request_iov(sf->conn, -1, SSH_FXP_LSTAT, &iov, 1,
++			       SSH_FXP_ATTRS, &outbuf);
++	buf_free(&buf);
++	if (err)
++		return err;
++	err = buf_get_attrs(&outbuf, &stbuf, NULL);
++	buf_free(&outbuf);
++	if (err || !S_ISREG(stbuf.st_mode) || (stbuf.st_mode & S_IWUSR))
++		return -EACCES;
++	err = sf_set_mode(sf, path, stbuf.st_mode | S_IWUSR);
++	if (err)
++		return err == LOST ? LOST : -EACCES;
++	err = sf_open_path(sf, path, handle, connver);
++	/* If this is lost too, the file keeps the owner's write permission */
++	sf_set_mode(sf, path, stbuf.st_mode);
++	return err;
++}
++
++/* Opens the file again on the current connection, by the path it has now.
++   Called with sf->lock held. */
++static int sf_open_again(struct sshfs_file *sf)
+ {
+-	int ret;
++	int err;
++	int connver;
++	char *path;
++	struct buffer handle;
+ 
+ 	pthread_mutex_lock(&sshfs.lock);
+-	ret = (sf->connver == sf->conn->connver);
++	path = g_strdup(sf->path);
+ 	pthread_mutex_unlock(&sshfs.lock);
++	if (path == NULL)
++		return -EIO;
++	err = sf_open_path(sf, path, &handle, &connver);
++	if (err == -EACCES && (sf->pflags & SSH_FXF_WRITE))
++		err = sf_open_unwritable(sf, path, &handle, &connver);
++	g_free(path);
++	if (err)
++		return err;
++	buf_free(&sf->handle);
++	sf->handle = handle;
++	sf->connver = connver;
++	return 0;
++}
+ 
+-	return ret;
++/* Sends again the writes lost with a closed connection, oldest first.
++   Called with sf->lock held and the file open on the current connection. */
++static int sf_replay_writes(struct sshfs_file *sf)
++{
++	struct sshfs_io sio = { .error = 0, .num_reqs = 0 };
++
++	pthread_cond_init(&sio.finished, NULL);
++	pthread_mutex_lock(&sshfs.lock);
++	while (!list_empty(&sf->lost_writes) &&
++	       sf->connver == sf->conn->connver) {
++		struct write_req *wr = list_entry(sf->lost_writes.next,
++						  struct write_req, list);
++		list_del(&wr->list);
++		wr->sio = &sio;
++		pthread_mutex_unlock(&sshfs.lock);
++		sshfs_send_write(sf, wr, sshfs_sync_write_begin,
++				 sshfs_sync_write_end);
++		pthread_mutex_lock(&sshfs.lock);
++	}
++	while (sio.num_reqs)
++		pthread_cond_wait(&sio.finished, &sshfs.lock);
++	/* For the writer, at close, whichever request sent them */
++	if (sio.error)
++		sf->write_error = sio.error;
++	else if (!list_empty(&sf->lost_writes))
++		sio.error = LOST;
++	pthread_mutex_unlock(&sshfs.lock);
++	return sio.error;
++}
++
++/* Frees the writes lost with a closed connection, and returns whether there
++   were any. Called with sshfs.lock held. */
++static int sf_drop_lost_writes(struct sshfs_file *sf)
++{
++	int dropped = !list_empty(&sf->lost_writes);
++
++	while (!list_empty(&sf->lost_writes)) {
++		struct write_req *wr = list_entry(sf->lost_writes.next,
++						  struct write_req, list);
++		list_del(&wr->list);
++		g_free(wr);
++	}
++	return dropped;
++}
++
++/* If the connection the file was opened on has closed, opens it again on
++   the current one and sends the writes lost with the old one */
++static int sf_refresh_file(struct sshfs_file *sf)
++{
++	int err = 0;
++	int tries;
++
++	pthread_mutex_lock(&sf->lock);
++	for (tries = 0; ; tries++) {
++		int stale;
++		int lost;
++
++		pthread_mutex_lock(&sshfs.lock);
++		stale = sf->connver != sf->conn->connver;
++		lost = !list_empty(&sf->lost_writes);
++		pthread_mutex_unlock(&sshfs.lock);
++		if (!stale && !lost) {
++			err = 0;
++			break;
++		}
++		if (tries == MAX_TRIES) {
++			err = -EIO;
++			break;
++		}
++		err = stale ? sf_open_again(sf) : 0;
++		if (err == -ENOENT) {
++			/* A rename may have moved it on the server before
++			   its path here changed: try again */
++			pthread_mutex_lock(&sshfs.lock);
++			if (sshfs.renames)
++				err = LOST;
++			pthread_mutex_unlock(&sshfs.lock);
++		}
++		if (err && err != LOST) {
++			/* It can't be opened again, as when it was deleted on
++			   the server, so its lost writes can't be sent: the
++			   writer gets the error at close */
++			pthread_mutex_lock(&sshfs.lock);
++			if (sf_drop_lost_writes(sf))
++				sf->write_error = err;
++			pthread_mutex_unlock(&sshfs.lock);
++			break;
++		}
++		if (!err)
++			err = sf_replay_writes(sf);
++		if (err && err != LOST)
++			break;
++	}
++	pthread_mutex_unlock(&sf->lock);
++	return err;
++}
++
++/* Sends the writes lost with a closed connection, for every open file, before
++   any other request goes out. Otherwise a stat could report a size from
++   before them, a read through another descriptor could miss them, and they
++   could overwrite a later write through another descriptor. */
++static void replay_lost_writes(void)
++{
++	GPtrArray *files;
++	struct list_head *pos;
++	guint i;
++
++	/* Read without the lock first: this runs before every request. The
++	   flags are written under the lock, but atomically for this read. */
++	if (!__atomic_load_n(&sshfs.writes_lost, __ATOMIC_ACQUIRE) &&
++	    !__atomic_load_n(&sshfs.replaying, __ATOMIC_ACQUIRE))
++		return;
++	pthread_mutex_lock(&sshfs.lock);
++	while (sshfs.replaying)
++		pthread_cond_wait(&sshfs.replay_cond, &sshfs.lock);
++	if (!sshfs.writes_lost) {
++		pthread_mutex_unlock(&sshfs.lock);
++		return;
++	}
++	__atomic_store_n(&sshfs.writes_lost, 0, __ATOMIC_RELEASE);
++	__atomic_store_n(&sshfs.replaying, 1, __ATOMIC_RELEASE);
++	files = g_ptr_array_new();
++	for (pos = sshfs.open_files.next; pos != &sshfs.open_files;
++	     pos = pos->next) {
++		struct sshfs_file *sf = list_entry(pos, struct sshfs_file,
++						   open_link);
++		if (!list_empty(&sf->lost_writes)) {
++			sf->refs++;
++			g_ptr_array_add(files, sf);
++		}
++	}
++	pthread_mutex_unlock(&sshfs.lock);
++
++	for (i = 0; i < files->len; i++) {
++		struct sshfs_file *sf = files->pdata[i];
++
++		sf_refresh_file(sf);
++		pthread_mutex_lock(&sshfs.lock);
++		/* Writes that couldn't be sent, such as while the server is
++		   unreachable, get another try before the next request */
++		if (!list_empty(&sf->lost_writes))
++			__atomic_store_n(&sshfs.writes_lost, 1,
++					 __ATOMIC_RELEASE);
++		if (--sf->refs == 0)
++			pthread_cond_broadcast(&sf->write_finished);
++		pthread_mutex_unlock(&sshfs.lock);
++	}
++	g_ptr_array_free(files, TRUE);
++	pthread_mutex_lock(&sshfs.lock);
++	__atomic_store_n(&sshfs.replaying, 0, __ATOMIC_RELEASE);
++	pthread_cond_broadcast(&sshfs.replay_cond);
++	pthread_mutex_unlock(&sshfs.lock);
++}
++
++static int sf_refresh(struct sshfs_file *sf)
++{
++	replay_lost_writes();
++	return sf_refresh_file(sf);
+ }
+ 
+ static inline struct sshfs_file *get_sshfs_file(struct fuse_file_info *fi)
+@@ -2814,30 +3411,19 @@ static int sshfs_chmod(const char *path, mode_t mode,
+ {
+ 	(void) fi;
+ 	int err;
+-	uint8_t type;
+ 	struct buffer buf;
+ 	struct sshfs_file *sf = NULL;
+ 
+-	if (fi != NULL) {
++	if (fi != NULL)
+ 		sf = get_sshfs_file(fi);
+-		if (!sshfs_file_is_conn(sf))
+-			return -EIO;
+-	}
+ 
+ 	buf_init(&buf, 0);
+-	if (sf == NULL) {
+-		type = buf_add_setstat_path(&buf, path);
+-	} else {
+-		buf_add_buf(&buf, &sf->handle);
+-		type = SSH_FXP_FSETSTAT;
+-	}
+-
+ 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_PERMISSIONS);
+ 	buf_add_uint32(&buf, mode);
+ 
+ 	// Commutes with pending write(), so we can use any connection
+ 	// if the file is not open.
+-	err = sftp_setstat(get_conn(sf, NULL), type, &buf, path, sf);
++	err = sftp_setstat(get_conn(sf, NULL), 0, &buf, path, sf);
+ 	buf_free(&buf);
+ 	return err;
+ }
+@@ -2847,15 +3433,11 @@ static int sshfs_chown(const char *path, uid_t uid, gid_t gid,
+ {
+ 	(void) fi;
+ 	int err;
+-	uint8_t type;
+ 	struct buffer buf;
+ 	struct sshfs_file *sf = NULL;
+ 
+-	if (fi != NULL) {
++	if (fi != NULL)
+ 		sf = get_sshfs_file(fi);
+-		if (!sshfs_file_is_conn(sf))
+-			return -EIO;
+-	}
+ 
+ 	if (sshfs.remote_uid_detected) {
+ 		if (uid == sshfs.local_uid)
+@@ -2871,19 +3453,13 @@ static int sshfs_chown(const char *path, uid_t uid, gid_t gid,
+ 			return -EPERM;
+ 
+ 	buf_init(&buf, 0);
+-	if (sf == NULL) {
+-		type = buf_add_setstat_path(&buf, path);
+-	} else {
+-		buf_add_buf(&buf, &sf->handle);
+-		type = SSH_FXP_FSETSTAT;
+-	}
+ 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_UIDGID);
+ 	buf_add_uint32(&buf, uid);
+ 	buf_add_uint32(&buf, gid);
+ 
+ 	// Commutes with pending write(), so we can use any connection
+ 	// if the file is not open.
+-	err = sftp_setstat(get_conn(sf, NULL), type, &buf, path, sf);
++	err = sftp_setstat(get_conn(sf, NULL), 0, &buf, path, sf);
+ 	buf_free(&buf);
+ 	return err;
+ }
+@@ -2903,7 +3479,6 @@ static int sshfs_utimens(const char *path, const struct timespec tv[2],
+ {
+ 	(void) fi;
+ 	int err;
+-	uint8_t type;
+ 	struct buffer buf;
+ 	struct sshfs_file *sf = NULL;
+ 	time_t asec = tv[0].tv_sec, msec = tv[1].tv_sec;
+@@ -2915,24 +3490,15 @@ static int sshfs_utimens(const char *path, const struct timespec tv[2],
+ 	if (msec == 0)
+ 		msec = now.tv_sec;
+ 
+-	if (fi != NULL) {
++	if (fi != NULL)
+ 		sf = get_sshfs_file(fi);
+-		if (!sshfs_file_is_conn(sf))
+-			return -EIO;
+-	}
+ 
+ 	buf_init(&buf, 0);
+-	if (sf == NULL) {
+-		type = buf_add_setstat_path(&buf, path);
+-	} else {
+-		buf_add_buf(&buf, &sf->handle);
+-		type = SSH_FXP_FSETSTAT;
+-	}
+ 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_ACMODTIME);
+ 	buf_add_uint32(&buf, asec);
+ 	buf_add_uint32(&buf, msec);
+ 
+-	err = sftp_setstat(get_conn(sf, path), type, &buf, path, sf);
++	err = sftp_setstat(get_conn(sf, path), 0, &buf, path, sf);
+ 	buf_free(&buf);
+ 	return err;
+ }
+@@ -2960,6 +3526,7 @@ static int sshfs_open_common(const char *path, mode_t mode,
+ 	uint64_t wrctr = 0;
+ 	char *parent = NULL;
+ 	struct request *parent_req;
++	int tries;
+ 
+ 	if (sshfs.dir_cache)
+ 		wrctr = cache_get_write_ctr();
+@@ -2990,7 +3557,13 @@ static int sshfs_open_common(const char *path, mode_t mode,
+ 
+ 	sf = g_new0(struct sshfs_file, 1);
+ 	list_init(&sf->write_reqs);
++	list_init(&sf->lost_writes);
+ 	pthread_cond_init(&sf->write_finished, NULL);
++	pthread_mutex_init(&sf->lock, NULL);
++	/* Without append, a write sent again goes where it went the first
++	   time instead of after it */
++	sf->pflags = pflags & ~(SSH_FXF_CREAT | SSH_FXF_EXCL | SSH_FXF_TRUNC |
++				SSH_FXF_APPEND);
+ 	/* Assume random read after open */
+ 	sf->is_seq = 0;
+ 	sf->next_pos = 0;
+@@ -3013,38 +3586,71 @@ static int sshfs_open_common(const char *path, mode_t mode,
+ 		sf->conn = &sshfs.conns[0];
+ 		sf->ce = NULL;
+ 	}
+-	sf->connver = sf->conn->connver;
+ 	pthread_mutex_unlock(&sshfs.lock);
+-	buf_init(&buf, 0);
+-	buf_add_path(&buf, path);
+-	buf_add_uint32(&buf, pflags);
+-	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_PERMISSIONS);
+-	buf_add_uint32(&buf, mode);
+-	buf_to_iov(&buf, &iov);
+-	sftp_request_send(sf->conn, SSH_FXP_OPEN, &iov, 1, NULL, NULL, 1, NULL,
+-			  &open_req);
+-	/* Creating a file changes its directory */
+-	if ((fi->flags & O_CREAT) && sshfs.dir_cache) {
+-		parent = g_path_get_dirname(path);
+-		sftp_stat_send(sf->conn, parent, NULL, &parent_req);
+-	}
+-	buf_clear(&buf);
+-	buf_add_path(&buf, path);
+ 	type = sshfs.follow_symlinks ? SSH_FXP_STAT : SSH_FXP_LSTAT;
+-	err2 = sftp_request(sf->conn, type, &buf, SSH_FXP_ATTRS, &outbuf);
+-	if (!err2) {
+-		err2 = buf_get_attrs(&outbuf, &stbuf, NULL);
+-		buf_free(&outbuf);
+-	}
+-	err = sftp_request_wait(open_req, SSH_FXP_OPEN, SSH_FXP_HANDLE,
+-				&sf->handle);
+-	if (parent) {
+-		sftp_stat_cache(parent_req, parent, wrctr, !err);
+-		g_free(parent);
++	for (tries = 0; ; tries++) {
++		/* The stat below carries a size: see sftp_request */
++		replay_lost_writes();
++		buf_init(&buf, 0);
++		buf_add_path(&buf, path);
++		buf_add_uint32(&buf, pflags);
++		buf_add_uint32(&buf, SSH_FILEXFER_ATTR_PERMISSIONS);
++		buf_add_uint32(&buf, mode);
++		buf_to_iov(&buf, &iov);
++		sftp_request_send(sf->conn, -1, SSH_FXP_OPEN, &iov, 1, NULL,
++				  NULL, 1, NULL, &open_req);
++		sf->connver = open_req->connver;
++		/* Creating a file changes its directory */
++		if ((fi->flags & O_CREAT) && sshfs.dir_cache) {
++			parent = g_path_get_dirname(path);
++			sftp_stat_send(sf->conn, parent, NULL, &parent_req);
++		}
++		buf_clear(&buf);
++		buf_add_path(&buf, path);
++		buf_to_iov(&buf, &iov);
++		err2 = sftp_request_iov(sf->conn, -1, type, &iov, 1,
++					SSH_FXP_ATTRS, &outbuf);
++		if (!err2) {
++			err2 = buf_get_attrs(&outbuf, &stbuf, NULL);
++			buf_free(&outbuf);
++		}
++		err = sftp_request_wait(open_req, SSH_FXP_OPEN, SSH_FXP_HANDLE,
++					&sf->handle);
++		if (parent) {
++			sftp_stat_cache(parent_req, parent, wrctr, !err);
++			g_free(parent);
++			parent = NULL;
++		}
++		buf_free(&buf);
++		/* An open that got its answer isn't sent again: the
++		   exclusive create below would take "exists" for its own */
++		if ((err == LOST || (!err && err2 == LOST)) &&
++		    tries < MAX_TRIES - 1) {
++			if (!err)
++				buf_free(&sf->handle);
++			continue;
++		}
++		/* macOS asks for an exclusive create of every new file. A
++		   repeat that finds the file there, empty, finds the one the
++		   lost request created a moment ago: open it */
++		if (tries && (pflags & SSH_FXF_EXCL) && err == -EPERM &&
++		    !err2 && S_ISREG(stbuf.st_mode) && stbuf.st_size == 0) {
++			pflags &= ~SSH_FXF_EXCL;
++			continue;
++		}
++		break;
+ 	}
++	/* Otherwise whether the lost request created it can't be told, so
++	   neither "created" nor "exists" would be safe to report */
++	if (tries && (pflags & SSH_FXF_EXCL) && err == -EPERM)
++		err = -EIO;
++	if (err == LOST)
++		err = -EIO;
++	if (err2 == LOST)
++		err2 = -EIO;
+ 	if (!err && err2) {
+ 		buf_finish(&sf->handle);
+-		sftp_request(sf->conn, SSH_FXP_CLOSE, &sf->handle, 0, NULL);
++		sftp_close(sf->conn, sf->connver, &sf->handle);
+ 		buf_free(&sf->handle);
+ 		err = err2;
+ 	}
+@@ -3053,6 +3659,10 @@ static int sshfs_open_common(const char *path, mode_t mode,
+ 		if (sshfs.dir_cache)
+ 			cache_add_attr(path, &stbuf, wrctr);
+ 		buf_finish(&sf->handle);
++		pthread_mutex_lock(&sshfs.lock);
++		sf->path = g_strdup(path);
++		list_add(&sf->open_link, &sshfs.open_files);
++		pthread_mutex_unlock(&sshfs.lock);
+ 		fi->fh = (unsigned long) sf;
+ 	} else {
+ 		if (sshfs.dir_cache)
+@@ -3069,9 +3679,9 @@ static int sshfs_open_common(const char *path, mode_t mode,
+ 			}
+ 			pthread_mutex_unlock(&sshfs.lock);
+ 		}
++		pthread_mutex_destroy(&sf->lock);
+ 		g_free(sf);
+ 	}
+-	buf_free(&buf);
+ 	return err;
+ }
+ 
+@@ -3088,9 +3698,7 @@ static int sshfs_flush(const char *path, struct fuse_file_info *fi)
+ 	struct list_head *curr_list;
+ 	struct request *stat_req = NULL;
+ 	uint64_t wrctr = 0;
+-
+-	if (!sshfs_file_is_conn(sf))
+-		return -EIO;
++	int lost;
+ 
+ 	if (sshfs.sync_write)
+ 		return 0;
+@@ -3111,7 +3719,20 @@ static int sshfs_flush(const char *path, struct fuse_file_info *fi)
+ 		while (!list_empty(&write_reqs))
+ 			pthread_cond_wait(&sf->write_finished, &sshfs.lock);
+ 	}
+-	err = sf->write_error;
++	pthread_mutex_unlock(&sshfs.lock);
++
++	/* Waits for another thread sending this file's lost writes */
++	pthread_mutex_lock(&sf->lock);
++	pthread_mutex_unlock(&sf->lock);
++	pthread_mutex_lock(&sshfs.lock);
++	lost = !list_empty(&sf->lost_writes);
++	pthread_mutex_unlock(&sshfs.lock);
++	/* Writes lost with a closed connection go out on the next one */
++	err = lost ? sf_refresh(sf) : 0;
++
++	pthread_mutex_lock(&sshfs.lock);
++	if (!err)
++		err = sf->write_error;
+ 	sf->write_error = 0;
+ 	pthread_mutex_unlock(&sshfs.lock);
+ 	if (stat_req)
+@@ -3132,25 +3753,29 @@ static int sshfs_fsync(const char *path, int isdatasync,
+ 	if (!sshfs.ext_fsync)
+ 		return err;
+ 
+-	struct buffer buf;
+-	struct sshfs_file *sf = get_sshfs_file(fi);
+-	buf_init(&buf, 0);
+-	buf_add_string(&buf, SFTP_EXT_FSYNC);
+-	buf_add_buf(&buf, &sf->handle);
+-	err = sftp_request(sf->conn, SSH_FXP_EXTENDED, &buf, SSH_FXP_STATUS, NULL);
+-	buf_free(&buf);
+-	return err;
++	return sf_request(get_sshfs_file(fi), SSH_FXP_EXTENDED, SFTP_EXT_FSYNC,
++			  NULL, SSH_FXP_STATUS, NULL);
+ }
+ 
+ static int sshfs_release(const char *path, struct fuse_file_info *fi)
+ {
+ 	struct sshfs_file *sf = get_sshfs_file(fi);
+-	struct buffer *handle = &sf->handle;
+-	if (sshfs_file_is_conn(sf)) {
+-		sshfs_flush(path, fi);
+-		sftp_request(sf->conn, SSH_FXP_CLOSE, handle, 0, NULL);
+-	}
+-	buf_free(handle);
++
++	sshfs_flush(path, fi);
++	pthread_mutex_lock(&sshfs.lock);
++	list_del(&sf->open_link);
++	while (sf->refs)
++		pthread_cond_wait(&sf->write_finished, &sshfs.lock);
++	g_free(sf->path);
++	pthread_mutex_unlock(&sshfs.lock);
++	pthread_mutex_lock(&sf->lock);
++	sftp_close(sf->conn, sf->connver, &sf->handle);
++	pthread_mutex_unlock(&sf->lock);
++	buf_free(&sf->handle);
++	/* Writes that couldn't be sent again; flush reported the error */
++	pthread_mutex_lock(&sshfs.lock);
++	sf_drop_lost_writes(sf);
++	pthread_mutex_unlock(&sshfs.lock);
+ 	chunk_put_locked(sf->readahead);
+ 	if (sshfs.max_conns > 1) {
+ 		struct conntab_entry *ce = sf->ce;
+@@ -3164,6 +3789,7 @@ static int sshfs_release(const char *path, struct fuse_file_info *fi)
+ 		}
+ 		pthread_mutex_unlock(&sshfs.lock);
+ 	}
++	pthread_mutex_destroy(&sf->lock);
+ 	g_free(sf);
+ 	return 0;
+ }
+@@ -3217,7 +3843,6 @@ static struct read_chunk *sshfs_send_read(struct sshfs_file *sf, size_t size,
+ 					  off_t offset)
+ {
+ 	struct read_chunk *chunk = g_new0(struct read_chunk, 1);
+-	struct buffer *handle = &sf->handle;
+ 
+ 	pthread_cond_init(&chunk->sio.finished, NULL);
+ 	list_init(&chunk->reqs);
+@@ -3230,6 +3855,7 @@ static struct read_chunk *sshfs_send_read(struct sshfs_file *sf, size_t size,
+ 		struct buffer buf;
+ 		struct iovec iov[1];
+ 		struct read_req *rreq;
++		int connver;
+ 		size_t bsize = size < sshfs.max_read ? size : sshfs.max_read;
+ 
+ 		rreq = g_new0(struct read_req, 1);
+@@ -3239,11 +3865,11 @@ static struct read_chunk *sshfs_send_read(struct sshfs_file *sf, size_t size,
+ 		list_add(&rreq->list, &chunk->reqs);
+ 
+ 		buf_init(&buf, 0);
+-		buf_add_buf(&buf, handle);
++		connver = sf_add_handle(sf, &buf);
+ 		buf_add_uint64(&buf, offset);
+ 		buf_add_uint32(&buf, bsize);
+ 		buf_to_iov(&buf, &iov[0]);
+-		err = sftp_request_send(sf->conn, SSH_FXP_READ, iov, 1,
++		err = sftp_request_send(sf->conn, connver, SSH_FXP_READ, iov, 1,
+ 					sshfs_read_begin,
+ 					sshfs_read_end,
+ 					0, rreq, NULL);
+@@ -3282,6 +3908,9 @@ static int wait_chunk(struct read_chunk *chunk, char *buf, size_t size)
+ 
+ 		if (rreq->res < 0) {
+ 			chunk->sio.error = rreq->res;
++			/* Read it all again after the reconnect */
++			if (rreq->res == LOST)
++				res = LOST;
+ 			break;
+ 		} if (rreq->res == 0) {
+ 			chunk->sio.error = MY_EOF;
+@@ -3404,38 +4033,116 @@ static int sshfs_read(const char *path, char *rbuf, size_t size, off_t offset,
+                       struct fuse_file_info *fi)
+ {
+ 	struct sshfs_file *sf = get_sshfs_file(fi);
++	int res = LOST;
++	int tries;
+ 	(void) path;
+ 
+-	if (!sshfs_file_is_conn(sf))
+-		return -EIO;
++	for (tries = 0; res == LOST && tries < MAX_TRIES; tries++) {
++		res = sf_refresh(sf);
++		if (res)
++			break;
++		if (sshfs.sync_read)
++			res = sshfs_sync_read(sf, rbuf, size, offset);
++		else
++			res = sshfs_async_read(sf, rbuf, size, offset);
++		if (res == LOST) {
++			/* Its read ahead was lost too */
++			pthread_mutex_lock(&sshfs.lock);
++			chunk_put(sf->readahead);
++			sf->readahead = NULL;
++			pthread_mutex_unlock(&sshfs.lock);
++		}
++	}
++	return res == LOST ? -EIO : res;
++}
+ 
+-	if (sshfs.sync_read)
+-		return sshfs_sync_read(sf, rbuf, size, offset);
+-	else
+-		return sshfs_async_read(sf, rbuf, size, offset);
++static struct write_req *write_req_new(struct sshfs_file *sf,
++				       const char *wbuf, size_t size,
++				       off_t offset)
++{
++	struct write_req *wr = g_malloc(sizeof(struct write_req) + size);
++
++	wr->sf = sf;
++	wr->sio = NULL;
++	wr->seq = 0;
++	wr->offset = offset;
++	wr->size = size;
++	memcpy(wr->data, wbuf, size);
++	return wr;
+ }
+ 
+-static void sshfs_write_begin(struct request *req)
++/* Sends a write with the file's handle. Called with sf->lock held. */
++static int sshfs_send_write(struct sshfs_file *sf, struct write_req *wr,
++			    request_func begin_func, request_func end_func)
+ {
+-	struct sshfs_file *sf = (struct sshfs_file *) req->data;
+-	list_add(&req->list, &sf->write_reqs);
++	int err;
++	struct buffer buf;
++	struct iovec iov[2];
++
++	buf_init(&buf, 0);
++	buf_add_buf(&buf, &sf->handle);
++	buf_add_uint64(&buf, wr->offset);
++	buf_add_uint32(&buf, wr->size);
++	buf_to_iov(&buf, &iov[0]);
++	iov[1].iov_base = wr->data;
++	iov[1].iov_len = wr->size;
++	err = sftp_request_send(sf->conn, sf->connver, SSH_FXP_WRITE, iov, 2,
++				begin_func, end_func, 0, wr, NULL);
++	buf_free(&buf);
++	return err;
+ }
+ 
+-static void sshfs_write_end(struct request *req)
++static int sshfs_write_result(struct request *req)
+ {
+ 	uint32_t serr;
+-	struct sshfs_file *sf = (struct sshfs_file *) req->data;
+ 
+ 	if (req->error)
+-		sf->write_error = req->error;
+-	else if (req->replied) {
++		return req->error;
++	if (req->replied) {
+ 		if (req->reply_type != SSH_FXP_STATUS) {
+ 			fprintf(stderr, "protocol error\n");
+ 		} else if (buf_get_uint32(&req->reply, &serr) != -1 &&
+ 			serr != SSH_FX_OK) {
+-			sf->write_error = -EIO;
++			return -EIO;
+ 		}
+ 	}
++	return 0;
++}
++
++/* Keeps a write lost with its connection, in the order writes were sent, so
++   sf_refresh sends it again. Called with sshfs.lock held. */
++static void sshfs_write_lost(struct write_req *wr)
++{
++	struct list_head *head = &wr->sf->lost_writes;
++	struct list_head *pos;
++
++	__atomic_store_n(&sshfs.writes_lost, 1, __ATOMIC_RELEASE);
++	for (pos = head->next; pos != head; pos = pos->next)
++		if (list_entry(pos, struct write_req, list)->seq > wr->seq)
++			break;
++	list_add(&wr->list, pos->prev);
++}
++
++static void sshfs_write_begin(struct request *req)
++{
++	struct write_req *wr = (struct write_req *) req->data;
++	wr->seq = ++sshfs.write_seq;
++	list_add(&req->list, &wr->sf->write_reqs);
++}
++
++static void sshfs_write_end(struct request *req)
++{
++	struct write_req *wr = (struct write_req *) req->data;
++	struct sshfs_file *sf = wr->sf;
++	int err = sshfs_write_result(req);
++
++	if (err == LOST) {
++		sshfs_write_lost(wr);
++	} else {
++		if (err)
++			sf->write_error = err;
++		g_free(wr);
++	}
+ 	list_del(&req->list);
+ 	pthread_cond_broadcast(&sf->write_finished);
+ }
+@@ -3444,52 +4151,46 @@ static int sshfs_async_write(struct sshfs_file *sf, const char *wbuf,
+ 			     size_t size, off_t offset)
+ {
+ 	int err = 0;
+-	struct buffer *handle = &sf->handle;
+ 
++	pthread_mutex_lock(&sf->lock);
+ 	while (!err && size) {
+-		struct buffer buf;
+-		struct iovec iov[2];
+ 		size_t bsize = size < sshfs.max_write ? size : sshfs.max_write;
+ 
+-		buf_init(&buf, 0);
+-		buf_add_buf(&buf, handle);
+-		buf_add_uint64(&buf, offset);
+-		buf_add_uint32(&buf, bsize);
+-		buf_to_iov(&buf, &iov[0]);
+-		iov[1].iov_base = (void *) wbuf;
+-		iov[1].iov_len = bsize;
+-		err = sftp_request_send(sf->conn, SSH_FXP_WRITE, iov, 2,
+-					sshfs_write_begin, sshfs_write_end,
+-					0, sf, NULL);
+-		buf_free(&buf);
++		err = sshfs_send_write(sf, write_req_new(sf, wbuf, bsize, offset),
++				       sshfs_write_begin, sshfs_write_end);
++		/* A lost write goes out again after the reconnect */
++		if (err == LOST)
++			err = 0;
+ 		size -= bsize;
+ 		wbuf += bsize;
+ 		offset += bsize;
+ 	}
++	pthread_mutex_unlock(&sf->lock);
+ 
+ 	return err;
+ }
+ 
+ static void sshfs_sync_write_begin(struct request *req)
+ {
+-	struct sshfs_io *sio = (struct sshfs_io *) req->data;
+-	sio->num_reqs++;
++	struct write_req *wr = (struct write_req *) req->data;
++	/* A write sent again keeps its place */
++	if (!wr->seq)
++		wr->seq = ++sshfs.write_seq;
++	wr->sio->num_reqs++;
+ }
+ 
+ static void sshfs_sync_write_end(struct request *req)
+ {
+-	uint32_t serr;
+-	struct sshfs_io *sio = (struct sshfs_io *) req->data;
++	struct write_req *wr = (struct write_req *) req->data;
++	struct sshfs_io *sio = wr->sio;
++	int err = sshfs_write_result(req);
+ 
+-	if (req->error) {
+-		sio->error = req->error;
+-	} else if (req->replied) {
+-		if (req->reply_type != SSH_FXP_STATUS) {
+-			fprintf(stderr, "protocol error\n");
+-		} else if (buf_get_uint32(&req->reply, &serr) != -1 &&
+-			serr != SSH_FX_OK) {
+-			sio->error = -EIO;
+-		}
++	if (err == LOST) {
++		sshfs_write_lost(wr);
++	} else {
++		if (err)
++			sio->error = err;
++		g_free(wr);
+ 	}
+ 	sio->num_reqs--;
+ 	if (!sio->num_reqs)
+@@ -3501,32 +4202,25 @@ static int sshfs_sync_write(struct sshfs_file *sf, const char *wbuf,
+ 			    size_t size, off_t offset)
+ {
+ 	int err = 0;
+-	struct buffer *handle = &sf->handle;
+ 	struct sshfs_io sio = { .error = 0, .num_reqs = 0 };
+ 
+ 	pthread_cond_init(&sio.finished, NULL);
+ 
++	pthread_mutex_lock(&sf->lock);
+ 	while (!err && size) {
+-		struct buffer buf;
+-		struct iovec iov[2];
+ 		size_t bsize = size < sshfs.max_write ? size : sshfs.max_write;
++		struct write_req *wr = write_req_new(sf, wbuf, bsize, offset);
+ 
+-		buf_init(&buf, 0);
+-		buf_add_buf(&buf, handle);
+-		buf_add_uint64(&buf, offset);
+-		buf_add_uint32(&buf, bsize);
+-		buf_to_iov(&buf, &iov[0]);
+-		iov[1].iov_base = (void *) wbuf;
+-		iov[1].iov_len = bsize;
+-		err = sftp_request_send(sf->conn, SSH_FXP_WRITE, iov, 2,
+-					sshfs_sync_write_begin,
+-					sshfs_sync_write_end,
+-					0, &sio, NULL);
+-		buf_free(&buf);
++		wr->sio = &sio;
++		err = sshfs_send_write(sf, wr, sshfs_sync_write_begin,
++				       sshfs_sync_write_end);
++		if (err == LOST)
++			err = 0;
+ 		size -= bsize;
+ 		wbuf += bsize;
+ 		offset += bsize;
+ 	}
++	pthread_mutex_unlock(&sf->lock);
+ 
+ 	pthread_mutex_lock(&sshfs.lock);
+ 	while (sio.num_reqs)
+@@ -3535,6 +4229,9 @@ static int sshfs_sync_write(struct sshfs_file *sf, const char *wbuf,
+ 
+ 	if (!err)
+ 		err = sio.error;
++	/* Sends the writes lost with a closed connection */
++	if (!err)
++		err = sf_refresh(sf);
+ 
+ 	return err;
+ }
+@@ -3547,8 +4244,9 @@ static int sshfs_write(const char *path, const char *wbuf, size_t size,
+ 
+ 	(void) path;
+ 
+-	if (!sshfs_file_is_conn(sf))
+-		return -EIO;
++	err = sf_refresh(sf);
++	if (err)
++		return err;
+ 
+ 	sshfs_inc_modifver();
+ 	sf->written = 1;
+@@ -3581,7 +4279,7 @@ static int sshfs_ext_statvfs(const char *path, struct statvfs *stbuf)
+ 	buf_add_string(&buf, SFTP_EXT_STATVFS);
+ 	buf_add_path(&buf, path);
+ 	err = sftp_request(get_conn(NULL, NULL), SSH_FXP_EXTENDED, &buf,
+-			   SSH_FXP_EXTENDED_REPLY, &outbuf);
++			   SSH_FXP_EXTENDED_REPLY, &outbuf, NULL);
+ 	if (!err) {
+ 		if (buf_get_statvfs(&outbuf, stbuf) == -1)
+ 			err = -EIO;
+@@ -3632,28 +4330,17 @@ static int sshfs_truncate(const char *path, off_t size,
+ 	struct buffer buf;
+ 	struct sshfs_file *sf = NULL;
+ 
+-	if (fi != NULL) {
++	if (fi != NULL)
+ 		sf = get_sshfs_file(fi);
+-		if (!sshfs_file_is_conn(sf))
+-			return -EIO;
+-	}
+ 
+ 	sshfs_inc_modifver();
+ 	if (sshfs.truncate_workaround)
+ 		return sshfs_truncate_workaround(path, size, fi);
+ 
+ 	buf_init(&buf, 0);
+-
+-	if (sf != NULL)
+-		buf_add_buf(&buf, &sf->handle);
+-	else
+-		buf_add_path(&buf, path);
+-
+ 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_SIZE);
+ 	buf_add_uint64(&buf, size);
+-	err = sftp_setstat(get_conn(sf, path),
+-			   sf == NULL ? SSH_FXP_SETSTAT : SSH_FXP_FSETSTAT,
+-			   &buf, path, sf);
++	err = sftp_setstat(get_conn(sf, path), 1, &buf, path, sf);
+ 	buf_free(&buf);
+ 
+ 	return err;
+@@ -3667,23 +4354,19 @@ static int sshfs_getattr(const char *path, struct stat *stbuf,
+ 	struct buffer outbuf;
+ 	struct sshfs_file *sf = NULL;
+ 
+-	if (fi != NULL && !sshfs.fstat_workaround) {
++	if (fi != NULL && !sshfs.fstat_workaround)
+ 		sf = get_sshfs_file(fi);
+-		if (!sshfs_file_is_conn(sf))
+-			return -EIO;
+-	}
+ 
+ 	buf_init(&buf, 0);
+ 	if(sf == NULL) {
+ 		buf_add_path(&buf, path);
+ 		err = sftp_request(get_conn(sf, path),
+ 				   sshfs.follow_symlinks ? SSH_FXP_STAT : SSH_FXP_LSTAT,
+-				   &buf, SSH_FXP_ATTRS, &outbuf);
++				   &buf, SSH_FXP_ATTRS, &outbuf, NULL);
+ 	}
+ 	else {
+-		buf_add_buf(&buf, &sf->handle);
+-		err = sftp_request(sf->conn, SSH_FXP_FSTAT, &buf,
+-				   SSH_FXP_ATTRS, &outbuf);
++		err = sf_request(sf, SSH_FXP_FSTAT, NULL, NULL, SSH_FXP_ATTRS,
++				 &outbuf);
+ 	}
+ 	if (!err) {
+ 		err = buf_get_attrs(&outbuf, stbuf, NULL);
+@@ -3826,6 +4509,8 @@ static int processing_init(void)
+ 		pthread_mutex_init(&sshfs.conns[i].lock_write, NULL);
+ 	pthread_cond_init(&sshfs.outstanding_cond, NULL);
+ 	pthread_cond_init(&sshfs.connect_cond, NULL);
++	list_init(&sshfs.open_files);
++	pthread_cond_init(&sshfs.replay_cond, NULL);
+ 	sshfs.reqtab = g_hash_table_new(NULL, NULL);
+ 	if (!sshfs.reqtab) {
+ 		fprintf(stderr, "failed to create hash table\n");

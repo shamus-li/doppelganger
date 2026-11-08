@@ -1,0 +1,150 @@
+diff --git a/sshfs.c b/sshfs.c
+index c97f66d..c0b18af 100644
+--- a/sshfs.c
++++ b/sshfs.c
+@@ -121,6 +121,7 @@
+ #define SFTP_EXT_STATVFS "statvfs@openssh.com"
+ #define SFTP_EXT_HARDLINK "hardlink@openssh.com"
+ #define SFTP_EXT_FSYNC "fsync@openssh.com"
++#define SFTP_EXT_LSETSTAT "lsetstat@openssh.com"
+ 
+ #define PROTO_VERSION 3
+ 
+@@ -373,6 +374,7 @@ struct sshfs {
+ 	int ext_statvfs;
+ 	int ext_hardlink;
+ 	int ext_fsync;
++	int ext_lsetstat;
+ 	struct fuse_operations *op;
+ 
+ 	/* statistics */
+@@ -1700,6 +1702,9 @@ static int sftp_init_reply_ok(struct conn *conn, struct buffer *buf,
+ 			if (strcmp(ext, SFTP_EXT_FSYNC) == 0 &&
+ 			    strcmp(extdata, "1") == 0)
+ 				sshfs.ext_fsync = 1;
++			if (strcmp(ext, SFTP_EXT_LSETSTAT) == 0 &&
++			    strcmp(extdata, "1") == 0)
++				sshfs.ext_lsetstat = 1;
+ 
+ 			free(ext);
+ 			free(extdata);
+@@ -2683,11 +2688,26 @@ static inline struct sshfs_file *get_sshfs_file(struct fuse_file_info *fi)
+ 	return (struct sshfs_file *) (uintptr_t) fi->fh;
+ }
+ 
++/* Adds the path to a request that sets its attributes, and returns the
++   request's type. SETSTAT follows symlinks on the server, so it would change
++   a link's target instead of the link (debian Bug#640038). */
++static uint8_t buf_add_setstat_path(struct buffer *buf, const char *path)
++{
++	if (!sshfs.ext_lsetstat) {
++		buf_add_path(buf, path);
++		return SSH_FXP_SETSTAT;
++	}
++	buf_add_string(buf, SFTP_EXT_LSETSTAT);
++	buf_add_path(buf, path);
++	return SSH_FXP_EXTENDED;
++}
++
+ static int sshfs_chmod(const char *path, mode_t mode,
+                        struct fuse_file_info *fi)
+ {
+ 	(void) fi;
+ 	int err;
++	uint8_t type;
+ 	struct buffer buf;
+ 	struct sshfs_file *sf = NULL;
+ 
+@@ -2698,20 +2718,19 @@ static int sshfs_chmod(const char *path, mode_t mode,
+ 	}
+ 
+ 	buf_init(&buf, 0);
+-	if (sf == NULL)
+-		buf_add_path(&buf, path);
+-	else
++	if (sf == NULL) {
++		type = buf_add_setstat_path(&buf, path);
++	} else {
+ 		buf_add_buf(&buf, &sf->handle);
++		type = SSH_FXP_FSETSTAT;
++	}
+ 
+ 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_PERMISSIONS);
+ 	buf_add_uint32(&buf, mode);
+ 
+-	/* FIXME: really needs LSETSTAT extension (debian Bug#640038) */
+ 	// Commutes with pending write(), so we can use any connection
+ 	// if the file is not open.
+-	err = sftp_request(get_conn(sf, NULL),
+-			   sf == NULL ? SSH_FXP_SETSTAT : SSH_FXP_FSETSTAT,
+-			   &buf, SSH_FXP_STATUS, NULL);
++	err = sftp_request(get_conn(sf, NULL), type, &buf, SSH_FXP_STATUS, NULL);
+ 	buf_free(&buf);
+ 	return err;
+ }
+@@ -2721,6 +2740,7 @@ static int sshfs_chown(const char *path, uid_t uid, gid_t gid,
+ {
+ 	(void) fi;
+ 	int err;
++	uint8_t type;
+ 	struct buffer buf;
+ 	struct sshfs_file *sf = NULL;
+ 
+@@ -2744,19 +2764,19 @@ static int sshfs_chown(const char *path, uid_t uid, gid_t gid,
+ 			return -EPERM;
+ 
+ 	buf_init(&buf, 0);
+-	if (sf == NULL)
+-		buf_add_path(&buf, path);
+-	else
++	if (sf == NULL) {
++		type = buf_add_setstat_path(&buf, path);
++	} else {
+ 		buf_add_buf(&buf, &sf->handle);
++		type = SSH_FXP_FSETSTAT;
++	}
+ 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_UIDGID);
+ 	buf_add_uint32(&buf, uid);
+ 	buf_add_uint32(&buf, gid);
+ 
+ 	// Commutes with pending write(), so we can use any connection
+ 	// if the file is not open.
+-	err = sftp_request(get_conn(sf, NULL),
+-			   sf == NULL ? SSH_FXP_SETSTAT : SSH_FXP_FSETSTAT,
+-			   &buf, SSH_FXP_STATUS, NULL);
++	err = sftp_request(get_conn(sf, NULL), type, &buf, SSH_FXP_STATUS, NULL);
+ 	buf_free(&buf);
+ 	return err;
+ }
+@@ -2776,6 +2796,7 @@ static int sshfs_utimens(const char *path, const struct timespec tv[2],
+ {
+ 	(void) fi;
+ 	int err;
++	uint8_t type;
+ 	struct buffer buf;
+ 	struct sshfs_file *sf = NULL;
+ 	time_t asec = tv[0].tv_sec, msec = tv[1].tv_sec;
+@@ -2794,17 +2815,17 @@ static int sshfs_utimens(const char *path, const struct timespec tv[2],
+ 	}
+ 
+ 	buf_init(&buf, 0);
+-	if (sf == NULL)
+-		buf_add_path(&buf, path);
+-	else
++	if (sf == NULL) {
++		type = buf_add_setstat_path(&buf, path);
++	} else {
+ 		buf_add_buf(&buf, &sf->handle);
++		type = SSH_FXP_FSETSTAT;
++	}
+ 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_ACMODTIME);
+ 	buf_add_uint32(&buf, asec);
+ 	buf_add_uint32(&buf, msec);
+ 
+-	err = sftp_request(get_conn(sf, path),
+-			   sf == NULL ? SSH_FXP_SETSTAT : SSH_FXP_FSETSTAT,
+-			   &buf, SSH_FXP_STATUS, NULL);
++	err = sftp_request(get_conn(sf, path), type, &buf, SSH_FXP_STATUS, NULL);
+ 	buf_free(&buf);
+ 	return err;
+ }

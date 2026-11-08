@@ -1,0 +1,181 @@
+diff --git a/cache.c b/cache.c
+index 4277163..35e4901 100644
+--- a/cache.c
++++ b/cache.c
+@@ -15,6 +15,7 @@
+ #include <glib.h>
+ #include <pthread.h>
+ #include <sys/stat.h>
++#include <unistd.h>
+ 
+ #define DEFAULT_CACHE_TIMEOUT_SECS 20
+ #define DEFAULT_MAX_CACHE_SIZE 10000
+@@ -31,6 +32,9 @@ struct cache {
+ 	unsigned int min_clean_interval_secs;
+ 	struct fuse_operations *next_oper;
+ 	GHashTable *table;
++	/* Opened files: struct file_attr */
++	GHashTable *files;
++	struct fuse *fuse;
+ 	pthread_mutex_t lock;
+ 	time_t last_cleaned;
+ 	uint64_t write_ctr;
+@@ -48,6 +52,15 @@ struct node {
+ 	time_t valid;
+ };
+ 
++struct file_attr {
++	/* As last seen on the server */
++	struct stat stat;
++	/* When 'stat' was read, or 0 after a local change */
++	time_t seen;
++	/* Changes seen on the server, so an open can tell it saw one */
++	unsigned int changes;
++};
++
+ struct readdir_handle {
+ 	const char *path;
+ 	void *buf;
+@@ -114,7 +127,11 @@ static struct node *cache_lookup(const char *path)
+ 
+ static void cache_purge(const char *path)
+ {
++	struct file_attr *file = g_hash_table_lookup(cache.files, path);
++
+ 	g_hash_table_remove(cache.table, path);
++	if (file)
++		file->seen = 0;
+ }
+ 
+ static void cache_purge_parent(const char *path)
+@@ -186,12 +203,68 @@ static struct node *cache_get(const char *path)
+ 	return node;
+ }
+ 
++static void *cache_invalidate_kernel(void *path)
++{
++	fuse_invalidate_path(cache.fuse, path);
++	g_free(path);
++	return NULL;
++}
++
++/* The kernel keeps file contents across opens, so drop them when the file
++   changed on the server. SFTP mtimes are whole seconds, so an edit that kept
++   the size in the second or so after the attributes were read wouldn't show:
++   count those as changed at the next look. */
++static void cache_check_file(const char *path, const struct stat *stbuf)
++{
++	struct file_attr *file = g_hash_table_lookup(cache.files, path);
++	pthread_t thread;
++
++	if (!file)
++		return;
++	if (file->seen && (file->stat.st_mtime != stbuf->st_mtime ||
++			   file->stat.st_size != stbuf->st_size ||
++			   file->seen - file->stat.st_mtime < 2)) {
++		/* Not from here: the kernel may need this request and
++		   cache.lock (to write dirty pages) while it invalidates */
++		char *p = g_strdup(path);
++		if (pthread_create(&thread, NULL, cache_invalidate_kernel, p)) {
++			/* Keep the old attributes, so the next look tries again */
++			g_free(p);
++			return;
++		}
++		pthread_detach(thread);
++		file->changes++;
++	}
++	file->stat = *stbuf;
++	file->seen = time(NULL);
++}
++
++/* Called with cache.lock held */
++static struct file_attr *cache_get_file(const char *path)
++{
++	struct file_attr *file = g_hash_table_lookup(cache.files, path);
++
++	if (file == NULL) {
++		file = g_new0(struct file_attr, 1);
++		g_hash_table_insert(cache.files, g_strdup(path), file);
++	}
++	return file;
++}
++
++static void cache_track_file(const char *path)
++{
++	pthread_mutex_lock(&cache.lock);
++	cache_get_file(path);
++	pthread_mutex_unlock(&cache.lock);
++}
++
+ void cache_add_attr(const char *path, const struct stat *stbuf, uint64_t wrctr)
+ {
+ 	struct node *node;
+ 
+ 	pthread_mutex_lock(&cache.lock);
+ 	if (wrctr == cache.write_ctr) {
++		cache_check_file(path, stbuf);
+ 		node = cache_get(path);
+ 		node->stat = *stbuf;
+ 		node->stat_valid = time(NULL) + cache.stat_timeout_secs;
+@@ -274,6 +347,7 @@ static void *cache_init(struct fuse_conn_info *conn,
+ {
+ 	void *res;
+ 	res = cache.next_oper->init(conn, cfg);
++	cache.fuse = fuse_get_context()->fuse;
+ 
+ 	// Cache requires a path for each request
+ 	cfg->nullpath_ok = 0;
+@@ -531,8 +605,34 @@ static int cache_create(const char *path, mode_t mode,
+                         struct fuse_file_info *fi)
+ {
+ 	int err = cache.next_oper->create(path, mode, fi);
+-	if (!err)
++	if (!err) {
+ 		cache_invalidate_dir(path);
++		cache_track_file(path);
++	}
++	return err;
++}
++
++static int cache_open(const char *path, struct fuse_file_info *fi)
++{
++	struct file_attr *file;
++	unsigned int changes;
++	int err;
++
++	pthread_mutex_lock(&cache.lock);
++	file = cache_get_file(path);
++	changes = file->changes;
++	pthread_mutex_unlock(&cache.lock);
++	/* sshfs reads the attributes while it opens the file */
++	err = cache.next_oper->open(path, fi);
++	pthread_mutex_lock(&cache.lock);
++	changes = file->changes - changes;
++	pthread_mutex_unlock(&cache.lock);
++	/* The kernel drops the old contents only once this open has returned,
++	   so waiting here for that would deadlock. A head start lets it drop
++	   them before the first read; without one, that read found the old
++	   contents 2 times in 20. */
++	if (changes)
++		usleep(10000);
+ 	return err;
+ }
+ 
+@@ -561,7 +661,7 @@ static void cache_fill(struct fuse_operations *oper,
+ 	cache_oper->listxattr = oper->listxattr;
+ 	cache_oper->mkdir    = oper->mkdir ? cache_mkdir : NULL;
+ 	cache_oper->mknod    = oper->mknod ? cache_mknod : NULL;
+-	cache_oper->open     = oper->open;
++	cache_oper->open     = oper->open ? cache_open : NULL;
+ 	cache_oper->opendir  = cache_opendir;
+ 	cache_oper->read     = oper->read;
+ 	cache_oper->readdir  = oper->readdir ? cache_readdir : NULL;
+@@ -593,6 +693,8 @@ struct fuse_operations *cache_wrap(struct fuse_operations *oper)
+ 		fprintf(stderr, "failed to create cache\n");
+ 		return NULL;
+ 	}
++	cache.files = g_hash_table_new_full(g_str_hash, g_str_equal,
++					    g_free, g_free);
+ 	return &cache_oper;
+ }
+ 
