@@ -45,6 +45,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         guard menu == self.menu else { return }
         isOpen = false
         monitor.panelOpen = false
+        // A check's result shows once, the next time the menu opens after the check.
+        updater.clearStatus()
     }
 
     // MARK: Rendering
@@ -148,8 +150,14 @@ final class StatusMenu: NSObject, NSMenuDelegate {
                              action: { [showLogs] in showLogs(errors > 0) },
                              badge: errors > 0 ? "\(errors) error\(errors == 1 ? "" : "s")" : nil))
         entries.append(Entry(id: "settings", title: "Settings…", key: ",", action: { [showSettings] in showSettings(.mounts) }))
-        entries.append(Entry(id: "updates", title: updater.available.map { "Update to \($0)…" } ?? "Check for Updates…",
-                             action: { [updater] in updater.checkForUpdates() }))
+        if let version = updater.ready {
+            entries.append(Entry(id: "updates", title: "Restart to Update to \(version)",
+                                 action: { [updater] in updater.restartToUpdate() }))
+        } else {
+            entries.append(Entry(id: "updates", title: updater.checking ? "Checking for Updates…" : "Check for Updates",
+                                 subtitle: updater.status, enabled: !updater.checking,
+                                 action: { [updater] in updater.checkForUpdates() }))
+        }
         entries.append(Entry(id: "about", title: "About Doppelganger", action: {
             NSApp.activate()
             NSApp.orderFrontStandardAboutPanel(nil)

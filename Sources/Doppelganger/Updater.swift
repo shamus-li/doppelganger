@@ -2,41 +2,88 @@ import AppKit
 import Observation
 import Sparkle
 
-/// Checks the GitHub releases for a newer build (Sparkle, with the feed and key in Info.plist).
-/// A found update shows in the status menu, since a menu bar app's update window opens behind other apps.
+/// Checks the GitHub releases for a newer build (Sparkle, with the feed and key in Info.plist), downloads
+/// it in the background, and offers it in the status menu instead of in Sparkle's windows.
 @MainActor
 @Observable
-final class Updater: NSObject, SPUStandardUserDriverDelegate {
-    /// The version of a found update the user hasn't looked at yet.
-    private(set) var available: String?
-    @ObservationIgnored private var controller: SPUStandardUpdaterController!
+final class Updater: NSObject, SPUUserDriver {
+    /// The version of a downloaded update waiting for the user to restart into it.
+    private(set) var ready: String?
+    private(set) var checking = false
+    /// The result of a check the user asked for, until the menu has shown it.
+    private(set) var status: String?
+    @ObservationIgnored private var install: ((SPUUserUpdateChoice) -> Void)?
+    @ObservationIgnored private var version: String?
+    @ObservationIgnored private var updater: SPUUpdater!
 
     override init() {
         super.init()
-        controller = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: self)
+        updater = SPUUpdater(hostBundle: .main, applicationBundle: .main, userDriver: self, delegate: nil)
+        do { try updater.start() } catch { status = error.localizedDescription }
     }
 
     func checkForUpdates() {
-        NSApp.activate()
-        controller.checkForUpdates(nil)
+        status = nil
+        updater.checkForUpdates()
     }
 
-    // MARK: SPUStandardUserDriverDelegate
+    func restartToUpdate() { install?(.install) }
 
-    nonisolated var supportsGentleScheduledUpdateReminders: Bool { true }
+    func clearStatus() { status = nil }
 
-    nonisolated func standardUserDriverWillHandleShowingUpdate(_ handleShowingUpdate: Bool, forUpdate update: SUAppcastItem,
-                                                               state: SPUUserUpdateState) {
-        let version = update.displayVersionString
-        let userInitiated = state.userInitiated
-        MainActor.assumeIsolated { if !userInitiated { available = version } }
+    // MARK: SPUUserDriver
+
+    func show(_ request: SPUUpdatePermissionRequest, reply: @escaping (SUUpdatePermissionResponse) -> Void) {
+        reply(SUUpdatePermissionResponse(automaticUpdateChecks: true, sendSystemProfile: false))
     }
 
-    nonisolated func standardUserDriverDidReceiveUserAttention(forUpdate update: SUAppcastItem) {
-        MainActor.assumeIsolated { available = nil }
+    func showUserInitiatedUpdateCheck(cancellation: @escaping () -> Void) { checking = true }
+
+    /// Downloads a new update right away; one downloaded earlier waits for the user.
+    func showUpdateFound(with appcastItem: SUAppcastItem, state: SPUUserUpdateState, reply: @escaping (SPUUserUpdateChoice) -> Void) {
+        checking = false
+        version = appcastItem.displayVersionString
+        if state.stage == .notDownloaded {
+            reply(.install)
+        } else {
+            offer(reply)
+        }
     }
 
-    nonisolated func standardUserDriverWillFinishUpdateSession() {
-        MainActor.assumeIsolated { available = nil }
+    func showReady(toInstallAndRelaunch reply: @escaping (SPUUserUpdateChoice) -> Void) { offer(reply) }
+
+    private func offer(_ reply: @escaping (SPUUserUpdateChoice) -> Void) {
+        install = reply
+        ready = version
+    }
+
+    func showUpdateReleaseNotes(with downloadData: SPUDownloadData) {}
+    func showUpdateReleaseNotesFailedToDownloadWithError(_ error: any Error) {}
+
+    func showUpdateNotFoundWithError(_ error: any Error, acknowledgement: @escaping () -> Void) {
+        checking = false
+        status = "Doppelganger is up to date."
+        acknowledgement()
+    }
+
+    func showUpdaterError(_ error: any Error, acknowledgement: @escaping () -> Void) {
+        checking = false
+        status = error.localizedDescription
+        acknowledgement()
+    }
+
+    func showDownloadInitiated(cancellation: @escaping () -> Void) {}
+    func showDownloadDidReceiveExpectedContentLength(_ expectedContentLength: UInt64) {}
+    func showDownloadDidReceiveData(ofLength length: UInt64) {}
+    func showDownloadDidStartExtractingUpdate() {}
+    func showExtractionReceivedProgress(_ progress: Double) {}
+    func showInstallingUpdate(withApplicationTerminated applicationTerminated: Bool, retryTerminatingApplication: @escaping () -> Void) {}
+
+    func showUpdateInstalledAndRelaunched(_ relaunched: Bool, acknowledgement: @escaping () -> Void) { acknowledgement() }
+
+    func dismissUpdateInstallation() {
+        checking = false
+        install = nil
+        ready = nil
     }
 }
