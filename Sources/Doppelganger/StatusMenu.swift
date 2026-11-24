@@ -6,6 +6,7 @@ import ServiceManagement
 @MainActor
 final class StatusMenu: NSObject, NSMenuDelegate {
     private let monitor: Monitor
+    private let updater: Updater
     private let showLogs: (_ errorsOnly: Bool) -> Void
     private let showSettings: (SettingsWindow.Pane) -> Void
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -13,8 +14,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private var actions: [String: () -> Void] = [:]
     private var isOpen = false
 
-    init(monitor: Monitor, showLogs: @escaping (_ errorsOnly: Bool) -> Void, showSettings: @escaping (SettingsWindow.Pane) -> Void) {
+    init(monitor: Monitor, updater: Updater, showLogs: @escaping (_ errorsOnly: Bool) -> Void, showSettings: @escaping (SettingsWindow.Pane) -> Void) {
         self.monitor = monitor
+        self.updater = updater
         self.showLogs = showLogs
         self.showSettings = showSettings
         super.init()
@@ -68,7 +70,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private func render() {
         let state = monitor.overallState
         statusItem.button?.image = state.icon
-        statusItem.button?.toolTip = "Doppelganger, \(state.title)"
+        // Setting a tooltip, even to the same text, resets it, and one reset while showing stays on screen.
+        let toolTip = "Doppelganger, \(state.title)"
+        if statusItem.button?.toolTip != toolTip { statusItem.button?.toolTip = toolTip }
         statusItem.button?.appearsDisabled = state == .stopped
         actions = [:]
         apply(entries(), to: menu)
@@ -100,7 +104,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             item.image = entry.image
             item.isEnabled = entry.enabled
             item.state = entry.checked ? .on : .off
-            item.toolTip = entry.toolTip
+            if item.toolTip != entry.toolTip { item.toolTip = entry.toolTip }
             item.isAlternate = entry.isAlternate
             if entry.isAlternate { item.keyEquivalentModifierMask = entry.key.isEmpty ? .option : [.command, .option] }
             if item.badge?.stringValue != entry.badge { item.badge = entry.badge.map(NSMenuItemBadge.init(string:)) }
@@ -144,6 +148,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
                              action: { [showLogs] in showLogs(errors > 0) },
                              badge: errors > 0 ? "\(errors) error\(errors == 1 ? "" : "s")" : nil))
         entries.append(Entry(id: "settings", title: "Settings…", key: ",", action: { [showSettings] in showSettings(.mounts) }))
+        entries.append(Entry(id: "updates", title: updater.available.map { "Update to \($0)…" } ?? "Check for Updates…",
+                             action: { [updater] in updater.checkForUpdates() }))
         entries.append(Entry(id: "about", title: "About Doppelganger", action: {
             NSApp.activate()
             NSApp.orderFrontStandardAboutPanel(nil)

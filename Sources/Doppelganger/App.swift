@@ -22,6 +22,7 @@ enum Entry {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var monitor: Monitor?
     private var statusMenu: StatusMenu?
+    private let updater = Updater()
     private let logsWindow = LogsWindow()
     private var settingsWindow: SettingsWindow?
 
@@ -31,7 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.monitor = monitor
         let settingsWindow = SettingsWindow(monitor: monitor)
         self.settingsWindow = settingsWindow
-        statusMenu = StatusMenu(monitor: monitor,
+        statusMenu = StatusMenu(monitor: monitor, updater: updater,
                                 showLogs: { [logsWindow] errorsOnly in logsWindow.show(errorsOnly: errorsOnly) },
                                 showSettings: { pane in settingsWindow.show(pane) })
         Task {

@@ -24,5 +24,11 @@
 	<string>15.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUPublicEDKey</key>
+	<string>KehpIUqsxiMCIVq3NmDMH3HHCwwvj10owznKR/7Rsb8=</string>
+	<key>SUFeedURL</key>
+	<string>https://github.com/shamus-li/doppelganger/releases/latest/download/appcast.xml</string>
 </dict>
 </plist>

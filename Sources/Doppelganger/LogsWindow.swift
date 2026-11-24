@@ -99,9 +99,8 @@ struct LogsView: View {
             }
             .width(16)
             TableColumn("Message") { entry in
+                // The whole message, since a tooltip in a row that's redrawn under the mouse stays on screen.
                 Text(entry.message)
-                    .lineLimit(3)
-                    .help(entry.message)
             }
         }
         .contextMenu(forSelectionType: LogEntry.ID.self) { ids in
